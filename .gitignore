@@ -1,0 +1,31 @@
+# Compiled output
+*.exe
+*.o
+*.res
+*.obj
+*.a
+*.lib
+*.pdb
+*.ilk
+*.map
+*.exp
+
+# Runtime config (user-local, generated at runtime)
+_AwSim.ini
+
+# Build system / IDE artefacts
+*.make
+Makefile
+.vscode/
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+
+# Windows thumbnails / desktop.ini
+Thumbs.db
+Desktop.ini
+ehthumbs.db
