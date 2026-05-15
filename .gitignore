@@ -29,11 +29,10 @@ Makefile
 Thumbs.db
 Desktop.ini
 ehthumbs.db
-*.zip  oldver*/  BMPfiles/  a/  files/  files.zip  *.cmd 
-*.zip 
-oldver*/ 
-BMPfiles/ 
-a/ 
-files/ 
-files.zip 
+*.zip  
+oldver*/  
+BMPfiles/  
+a/  
+files/  
+files.zip  
 *.cmd 
