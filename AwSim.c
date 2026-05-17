@@ -122,10 +122,10 @@ static const int S2_FS_X2[4]  = { 484, 475, 501, 466 };
 #define S2_RST_Y1   75
 #define S2_RST_Y2  115
 /* MPC + button                                                */
-#define S2_MPC_X1  192
-#define S2_MPC_X2  207
-#define S2_MPC_Y1   47
-#define S2_MPC_Y2   65
+#define S2_MPC_X1  173
+#define S2_MPC_X2  189
+#define S2_MPC_Y1   50
+#define S2_MPC_Y2   66
 /* Circle draw-centres                                         */
 #define S2_CR_CX    22
 #define S2_FS_CX   333
@@ -512,61 +512,92 @@ static void SendKey(WORD vk) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   AUTOMATION THREAD  — Engine #1 "AwSim"
+   AUTOMATION THREAD  — multi-engine dispatcher
    ─────────────────────────────────────────────────────────────
-   Selects 2 (MPC=1) or 3 random active boxes each Cycle.
-   Box sequence and Move count are controlled by MPC (1-5).
+   Engine is determined by the active CR button (1-4).
 
-   Move-pair table (origin → dest in box[0..2]):
-     Move 1: box[0]→box[1]
-     Move 2: box[1]→box[2]
-     Move 3: box[2]→box[0]
-     Move 4: box[0]→box[1]  (repeat)
-     Move 5: box[1]→box[2]
+   ENGINE 1 — AwSim
+     All boxes drawn from the active set.
 
-   Each Move steps:
-     1. Click destination box
-     2. Click origin box
-     3. Press A
-     4. Click origin box  (now receives the swapped piece)
-     5. Press A
-     6. Wait 3333 ms
+   ENGINE 2 — Decoy
+     Box1 and Box3 drawn from the active set.
+     Box2 drawn from the inactive set.
+     Requires ≥1 inactive box.
 
-   Before the very first Cycle: send A X X (game cursor reset).
-   After each Cycle: double-click the active Target (Refresh).
+   Box count:  MPC=1 → 2 boxes (Box1, Box2)
+               MPC≥2 → 3 boxes (Box1, Box2, Box3)
+
+   Move sequence, first-cycle reset, and Target Refresh
+   are identical across all engines.
 ═══════════════════════════════════════════════════════════════ */
 DWORD WINAPI AutoRun(LPVOID _u) {
     (void)_u;
     srand((unsigned)time(NULL) ^ GetCurrentThreadId());
 
-    int  mpc       = engVars[12] - '0';   /* 1..5 */
-    int  need      = (mpc == 1) ? 2 : 3;
+    /* Which CR engine is active? */
+    int engine = 1;
+    for (int i = 1; i <= 4; i++)
+        if (engVars[i] != '0') { engine = i; break; }
+
+    int  mpc        = engVars[12] - '0';   /* 1..5 */
+    int  need       = (mpc == 1) ? 2 : 3;
     BOOL firstCycle = TRUE;
 
-    /* Move pairs: (originIdx, destIdx) into box[0..2] */
     static const int MV_ORG[5] = { 0, 1, 2, 0, 1 };
     static const int MV_DST[5] = { 1, 2, 0, 1, 2 };
 
     for (;;) {
-        /* ── Collect active (checked) boxes ─── */
-        int olist[NCELLS], no = 0;
-        for (int i = 0; i < NCELLS; i++)
-            if (occ[i]) olist[no++] = i;
+        /* ── Build active / inactive lists each cycle ─── */
+        int aList[NCELLS], na = 0;
+        int iList[NCELLS], ni = 0;
+        for (int i = 0; i < NCELLS; i++) {
+            if (occ[i]) aList[na++] = i;
+            else        iList[ni++] = i;
+        }
 
-        if (no < need) {
+        /* ── Minimum-box check (engine-specific) ─── */
+        BOOL ok;
+        switch (engine) {
+        case 2:   /* Decoy: (need-1) active + 1 inactive */
+            ok = (na >= need - 1) && (ni >= 1);
+            break;
+        default:  /* AwSim: all boxes from active */
+            ok = (na >= need);
+            break;
+        }
+        if (!ok) {
             if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) break;
             continue;
         }
 
-        /* ── Pick 'need' distinct random boxes (partial-shuffle) ─── */
-        int tmp[NCELLS];
-        memcpy(tmp, olist, no * sizeof(int));
-        for (int i = 0; i < need; i++) {
-            int j = i + rand() % (no - i);
-            int t = tmp[i]; tmp[i] = tmp[j]; tmp[j] = t;
+        /* ── Select boxes (engine-specific) ─── */
+        int box[3] = {-1, -1, -1};
+        int tmpA[NCELLS];
+        memcpy(tmpA, aList, na * sizeof(int));
+
+        switch (engine) {
+
+        case 2: {   /* Decoy */
+            /* Box1: random from active */
+            int j = rand() % na;
+            box[0] = tmpA[j];  tmpA[j] = tmpA[--na];  /* remove from pool */
+            /* Box2: random from inactive */
+            box[1] = iList[rand() % ni];
+            /* Box3: random from remaining active (only when need==3) */
+            if (need == 3)
+                box[2] = tmpA[rand() % na];
+            break;
         }
-        int box[3] = {-1,-1,-1};
-        for (int i = 0; i < need; i++) box[i] = tmp[i];
+
+        default: {  /* AwSim — partial-shuffle active list */
+            for (int i = 0; i < need; i++) {
+                int j = i + rand() % (na - i);
+                int t = tmpA[i]; tmpA[i] = tmpA[j]; tmpA[j] = t;
+            }
+            for (int i = 0; i < need; i++) box[i] = tmpA[i];
+            break;
+        }
+        }
 
         /* ── Screen centres for selected boxes ─── */
         int bx[3], by[3];
@@ -578,30 +609,25 @@ DWORD WINAPI AutoRun(LPVOID _u) {
             SendKey(0x41);   /* A */
             SendKey(0x58);   /* X */
             SendKey(0x58);   /* X */
-            if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) break;
+            if (WaitForSingleObject(hStop, 250) == WAIT_OBJECT_0) break; /* pre-move delay */
         }
 
         /* ── Execute MPC Moves ─── */
         for (int m = 0; m < mpc; m++) {
-            int oi = MV_ORG[m];   /* origin index in box[]  */
-            int di = MV_DST[m];   /* dest   index in box[]  */
+            int oi = MV_ORG[m];
+            int di = MV_DST[m];
 
-            /* 2. click origin */
             DoClick(bx[oi], by[oi]);
             if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
 
-            /* 3. press A */
             SendKey(0x41);
             if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
 
-            /* 1. click destination */
             DoClick(bx[di], by[di]);
             if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
 
-            /* 5. press A */
             SendKey(0x41);
 
-            /* 6. wait 3333 ms (interruptible) */
             if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) goto stop;
         }
 
@@ -639,10 +665,18 @@ static void StartAuto(void) {
     if (!gridSet)             { pendingStart = TRUE; StartCap(1);             return; }
     /* Capture active target coord if not set */
     if (!tgtSet[activeTgt])   { pendingStart = TRUE; StartCap(2 + activeTgt); return; }
-    /* Need at least one occupied cell */
-    int no = 0;
-    for (int i = 0; i < NCELLS; i++) if (occ[i]) no++;
-    if (no == 0) return;
+    /* Determine active engine and check minimum box requirements */
+    int engine = 1;
+    for (int i = 1; i <= 4; i++)
+        if (engVars[i] != '0') { engine = i; break; }
+    int mpc  = engVars[12] - '0';
+    int need = (mpc == 1) ? 2 : 3;
+    int na = 0, ni = 0;
+    for (int i = 0; i < NCELLS; i++) { if (occ[i]) na++; else ni++; }
+    switch (engine) {
+    case 2:  if (na < need-1 || ni < 1) return;  break;
+    default: if (na < need)             return;  break;
+    }
     /* All prerequisites met — launch thread */
     hStop   = CreateEventA(NULL, TRUE, FALSE, NULL);
     hHook   = SetWindowsHookExA(WH_MOUSE_LL, ProcHook, hI, 0);
@@ -660,6 +694,9 @@ static void StopAuto(void) {
     if (hHook) { UnhookWindowsHookEx(hHook); hHook = NULL; }
     running = FALSE;
     InvalidateSect(0);    /* restore Start button */
+    /* Pop the UI to the front so it's immediately accessible */
+    SetWindowPos(wMain, HWND_TOP, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+    SetForegroundWindow(wMain);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -962,13 +999,13 @@ static void FlashRect(HDC dc, int x1, int y1, int x2, int y2) {
 static void DrawMpcSeg(HDC dc, int val) {
     /* Absolute section-2 coords, derived from pixel scan of BMP '8' */
     static const RECT SEG[7] = {
-        {158,50,164,51},   /* 0 TOP */
-        {158,57,164,58},   /* 1 MID */
-        {158,64,164,65},   /* 2 BOT */
-        {157,51,158,57},   /* 3 TL  */
-        {164,51,165,57},   /* 4 TR  */
-        {157,58,158,64},   /* 5 BL  */
-        {164,58,165,64},   /* 6 BR  */
+        {152,51,158,52},   /* 0 TOP */
+        {152,58,158,59},   /* 1 MID */
+        {152,65,158,66},   /* 2 BOT */
+        {151,52,152,58},   /* 3 TL  */
+        {158,52,159,58},   /* 4 TR  */
+        {151,59,152,65},   /* 5 BL  */
+        {158,59,159,65},   /* 6 BR  */
     };
     /* TOP MID BOT TL TR BL BR  for digits 1-5 */
     static const BYTE MASK[5][7] = {
@@ -1064,14 +1101,14 @@ static void DrawDyn2(HDC dc) {
             DrawEPDiamond(dc, 521, S2_CY[r]+2);
     }
 
-    /* MPC digit as 7-segment (red FF0000) */
-    DrawMpcSeg(dc, engVars[12] - '0');
+    /* MPC digit: only shown when Engine 1 (AwSim) or Engine 2 (Decoy) is active */
+    if (engVars[1] != '0' || engVars[2] != '0')
+        DrawMpcSeg(dc, engVars[12] - '0');
 
     /* MPC '+' flash: filled dot r=8 in DCE314.
        Centre = 3px right + 10px down from top-left of former vertical bar. */
     if (flashMask & FLASH_MPC) {
-        int bx = (S2_MPC_X1 + S2_MPC_X2) / 2;
-        int dot_cx = bx + 3,  dot_cy = S2_MPC_Y1 + 10;
+        int dot_cx = 181, dot_cy = 58;   /* section-2-relative, matches click region */
         HBRUSH fl = CreateSolidBrush(RGB(220,227,20));
         HPEN   np = CreatePen(PS_NULL, 0, 0);
         HBRUSH ob = (HBRUSH)SelectObject(dc, fl);
@@ -1083,7 +1120,7 @@ static void DrawDyn2(HDC dc) {
 
     /* #/. toggle and Reset flash: filled dot r=16 at button centre */
     if (flashMask & FLASH_DN) {
-        int cx = (S2_DN_X1  + S2_DN_X2)  / 2,  cy = (S2_DN_Y1  + S2_DN_Y2)  / 2;
+        int cx = (S2_DN_X1  + S2_DN_X2)  / 2 + 1,  cy = (S2_DN_Y1  + S2_DN_Y2)  / 2 + 1;
         HBRUSH fl = CreateSolidBrush(RGB(220,227,20));
         HPEN   np = CreatePen(PS_NULL, 0, 0);
         HBRUSH ob = (HBRUSH)SelectObject(dc, fl);
@@ -1093,7 +1130,7 @@ static void DrawDyn2(HDC dc) {
         DeleteObject(fl);  DeleteObject(np);
     }
     if (flashMask & FLASH_RST) {
-        int cx = (S2_RST_X1 + S2_RST_X2) / 2,  cy = (S2_RST_Y1 + S2_RST_Y2) / 2;
+        int cx = (S2_RST_X1 + S2_RST_X2) / 2 + 1,  cy = (S2_RST_Y1 + S2_RST_Y2) / 2 + 1;
         HBRUSH fl = CreateSolidBrush(RGB(220,227,20));
         HPEN   np = CreatePen(PS_NULL, 0, 0);
         HBRUSH ob = (HBRUSH)SelectObject(dc, fl);
@@ -1118,12 +1155,18 @@ static void DrawDyn3(HDC dc) {
         HPEN   pen = CreatePen(PS_SOLID, 1, RGB(220,227,20));
         HPEN   op  = (HPEN)SelectObject(dc, pen);
         HBRUSH ob  = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, S3_PRES_X1, S3_PRES_Y1-2, S3_PRES_X1+62, S3_PRES_Y1-2+20);
+        Rectangle(dc, S3_PRES_X1-1, S3_PRES_Y1-3, S3_PRES_X1-1+62, S3_PRES_Y1-3+20);
         SelectObject(dc, op);  SelectObject(dc, ob);
         DeleteObject(pen);
     }
-    if (flashMask & FLASH_XEROX)
-        FlashRect(dc, 353, 3, 414, 23);
+    if (flashMask & FLASH_XEROX) {
+        HPEN   pen = CreatePen(PS_SOLID, 1, RGB(220,227,20));
+        HPEN   op  = (HPEN)SelectObject(dc, pen);
+        HBRUSH ob  = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, 353, 1, 416, 21);
+        SelectObject(dc, op);  SelectObject(dc, ob);
+        DeleteObject(pen);
+    }
 }
 
 /* ── Section 4: FE5D18 border around active target ──────── */
@@ -1287,7 +1330,7 @@ LRESULT CALLBACK ProcMain(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             for (int i = 0; i < 4; i++) if (sectionY[i] >= 0) bot = i;
             if (bot >= 0 && bot <= 2) {
                 int ly = sectionY[bot] + SECT_H[bot] - 2;
-                RECT lr = {3, ly, 576, ly+2};
+                RECT lr = {0, ly, 580, ly+2};
                 HBRUSH lb = CreateSolidBrush(RGB(96,142,161));  /* 608EA1 */
                 FillRect(dc, &lr, lb);
                 DeleteObject(lb);
