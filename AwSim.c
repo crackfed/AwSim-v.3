@@ -190,6 +190,11 @@ static int  activeTgt = 0;
 static DWORD tgtLastTick[NTGTS];
 static int   tgtClickCnt[NTGTS];
 
+/* Row button calibration (Engine 8) ─────────────────────────── */
+static int  rb1x, rb1y;          /* MR1 centre — top-left  button */
+static int  rb2x, rb2y;          /* SR4 centre — bot-right button */
+static BOOL rb1Set = FALSE, rb2Set = FALSE;
+
 /* Game screen grid ──────────────────────────────────────────── */
 static int  gx, gy, gw, gh;
 static BOOL gridSet = FALSE;
@@ -279,6 +284,10 @@ static void SaveIni(void) {
         sprintf(key, "_Tgt%cY",   'A'+i); IniSetInt(key, tgtY[i]);
         sprintf(key, "_Tgt%cSet", 'A'+i); IniSetInt(key, tgtSet[i]?1:0);
     }
+    IniSetInt("_Rb1X", rb1x);  IniSetInt("_Rb1Y", rb1y);
+    IniSetInt("_Rb1Set", rb1Set ? 1 : 0);
+    IniSetInt("_Rb2X", rb2x);  IniSetInt("_Rb2Y", rb2y);
+    IniSetInt("_Rb2Set", rb2Set ? 1 : 0);
     char s[NCELLS+1];
     for (int i = 0; i < NCELLS; i++) s[i] = customOcc[i] ? '1' : '0';
     s[NCELLS] = '\0';
@@ -306,6 +315,10 @@ static void LoadIni(void) {
         sprintf(key, "_Tgt%cY",   'A'+i); tgtY[i]  = IniGetInt(key, -1);
         sprintf(key, "_Tgt%cSet", 'A'+i); tgtSet[i] = IniGetInt(key,0)?TRUE:FALSE;
     }
+    rb1x = IniGetInt("_Rb1X", 0);  rb1y = IniGetInt("_Rb1Y", 0);
+    rb1Set = IniGetInt("_Rb1Set", 0) ? TRUE : FALSE;
+    rb2x = IniGetInt("_Rb2X", 0);  rb2y = IniGetInt("_Rb2Y", 0);
+    rb2Set = IniGetInt("_Rb2Set", 0) ? TRUE : FALSE;
     char s[NCELLS+2] = "";
     IniGetStr("_CustomOcc", "", s, sizeof s);
     int slen = (int)strlen(s);
@@ -512,128 +525,203 @@ static void SendKey(WORD vk) {
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   AUTOMATION THREAD  — multi-engine dispatcher
+   ENGINE 7 HELPERS  — Column Ops
+═══════════════════════════════════════════════════════════════ */
+
+/* True if column col (0-indexed) has at least one active cell. */
+static BOOL ColIsActive(int col) {
+    for (int r = 0; r < GROWS; r++)
+        if (occ[r * GCOLS + col]) return TRUE;
+    return FALSE;
+}
+
+/* One pass over all active columns, left to right.
+   extended=FALSE → Normal pass (ShiftDown ×3 then TargetRefresh).
+   extended=TRUE  → Extended pass (Mirror, then ShiftDown ×3, then TargetRefresh).
+   Returns FALSE if the stop event fires mid-pass.                */
+static BOOL RunE7Pass(BOOL extended) {
+    int btnY = gy - 15;
+    for (int col = 0; col < GCOLS; col++) {
+        if (!ColIsActive(col)) continue;
+        int sdX = gx + 55 + (int)((double)col * gw / GCOLS);  /* ShiftDown  */
+        int mrX = gx + 25 + (int)((double)col * gw / GCOLS);  /* Mirror     */
+
+        if (extended) {
+            DoClick(mrX, btnY);
+            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        }
+        for (int k = 0; k < 3; k++) {
+            DoClick(sdX, btnY);
+            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        }
+        DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+        if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Engine 7 full sequence: (Normal [+ Extended]) × 2, then done. */
+static BOOL RunEngine7(void) {
+    BOOL ext = (engVars[10] != '0');   /* EP10 = Extended Mode */
+    for (int round = 0; round < 2; round++) {
+        if (!RunE7Pass(FALSE))        return FALSE;
+        if (ext && !RunE7Pass(TRUE))  return FALSE;
+    }
+    return TRUE;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   ENGINE 8 HELPERS  — Row Ops
    ─────────────────────────────────────────────────────────────
-   Engine is determined by the active CR button (1-4).
+   12 buttons left of the boxgrid: MR/SL/SR × rows 1-4.
+   User calibrates 2 points: MR1 (top-left) and SR4 (bot-right).
+   All other button centres are interpolated from those.
+   Column 0=MR  1=SL  2=SR.   Row 0=row1 … 3=row4.
+═══════════════════════════════════════════════════════════════ */
+static void RowBtnXY(int col, int row, int *x, int *y) {
+    /* x: interpolate between left-col (rb1x) and right-col (rb2x) */
+    *x = rb1x + (int)((double)col * (rb2x - rb1x) / 2.0);
+    /* y: fixed offsets from grid top (gy), matching boxgrid row centres */
+    static const int ROW_DY[4] = { 20, 58, 97, 135 };
+    *y = gy + ROW_DY[row];
+}
 
-   ENGINE 1 — AwSim
-     All boxes drawn from the active set.
+/* One Basic-Mode pass: rows 4 → 3 → 2 → 1.
+   Sequence per row: DoDbl(SR), wait, click(SL), wait,
+                     DoDbl(SL), wait, click(SL), DoDbl(Target).  */
+static BOOL RunE8Pass(void) {
+    for (int row = 3; row >= 0; row--) {
+        int srX, srY, slX, slY;
+        RowBtnXY(2, row, &srX, &srY);
+        RowBtnXY(1, row, &slX, &slY);
 
-   ENGINE 2 — Decoy
-     Box1 and Box3 drawn from the active set.
-     Box2 drawn from the inactive set.
-     Requires ≥1 inactive box.
+        DoDbl(srX, srY);
+        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        DoClick(slX, slY);
+        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        DoDbl(slX, slY);
+        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        DoClick(slX, slY);
+        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+        if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
+    }
+    return TRUE;
+}
 
-   Box count:  MPC=1 → 2 boxes (Box1, Box2)
-               MPC≥2 → 3 boxes (Box1, Box2, Box3)
+/* Engine 8: one pass (+ repeat if EP11 = Extended Mode). */
+static BOOL RunEngine8(void) {
+    BOOL ext = (engVars[11] != '0');   /* EP11 = Extended Mode */
+    /* Single click on Target to give the game window focus before the
+       first action — without it the opening DoDbl lands as one click. */
+    DoClick(tgtX[activeTgt], tgtY[activeTgt]);
+    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
+    if (!RunE8Pass()) return FALSE;
+    if (ext && !RunE8Pass()) return FALSE;
+    return TRUE;
+}
 
-   Move sequence, first-cycle reset, and Target Refresh
-   are identical across all engines.
+
+/* ═══════════════════════════════════════════════════════════════
+   AUTOMATION THREAD  — two-phase dispatcher
+   ─────────────────────────────────────────────────────────────
+   Phase 1: Active FS engines (5-8) run once each in run-order.
+   Phase 2: Active CR engine (1-4) runs indefinitely, or stops.
 ═══════════════════════════════════════════════════════════════ */
 DWORD WINAPI AutoRun(LPVOID _u) {
     (void)_u;
     srand((unsigned)time(NULL) ^ GetCurrentThreadId());
 
-    /* Which CR engine is active? */
-    int engine = 1;
-    for (int i = 1; i <= 4; i++)
-        if (engVars[i] != '0') { engine = i; break; }
-
-    int  mpc        = engVars[12] - '0';   /* 1..5 */
-    int  need       = (mpc == 1) ? 2 : 3;
-    BOOL firstCycle = TRUE;
-
     static const int MV_ORG[5] = { 0, 1, 2, 0, 1 };
     static const int MV_DST[5] = { 1, 2, 0, 1, 2 };
 
-    for (;;) {
-        /* ── Build active / inactive lists each cycle ─── */
-        int aList[NCELLS], na = 0;
-        int iList[NCELLS], ni = 0;
-        for (int i = 0; i < NCELLS; i++) {
-            if (occ[i]) aList[na++] = i;
-            else        iList[ni++] = i;
-        }
-
-        /* ── Minimum-box check (engine-specific) ─── */
-        BOOL ok;
-        switch (engine) {
-        case 2:   /* Decoy: (need-1) active + 1 inactive */
-            ok = (na >= need - 1) && (ni >= 1);
-            break;
-        default:  /* AwSim: all boxes from active */
-            ok = (na >= need);
-            break;
-        }
-        if (!ok) {
-            if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) break;
-            continue;
-        }
-
-        /* ── Select boxes (engine-specific) ─── */
-        int box[3] = {-1, -1, -1};
-        int tmpA[NCELLS];
-        memcpy(tmpA, aList, na * sizeof(int));
-
-        switch (engine) {
-
-        case 2: {   /* Decoy */
-            /* Box1: random from active */
-            int j = rand() % na;
-            box[0] = tmpA[j];  tmpA[j] = tmpA[--na];  /* remove from pool */
-            /* Box2: random from inactive */
-            box[1] = iList[rand() % ni];
-            /* Box3: random from remaining active (only when need==3) */
-            if (need == 3)
-                box[2] = tmpA[rand() % na];
-            break;
-        }
-
-        default: {  /* AwSim — partial-shuffle active list */
-            for (int i = 0; i < need; i++) {
-                int j = i + rand() % (na - i);
-                int t = tmpA[i]; tmpA[i] = tmpA[j]; tmpA[j] = t;
+    /* ── Phase 1: FS engines in run-order value (1 = first) ─── */
+    for (int ord = 1; ord <= 4; ord++) {
+        for (int fsi = 5; fsi <= 8; fsi++) {
+            if ((engVars[fsi] - '0') != ord) continue;
+            switch (fsi) {
+            case 7:  if (!RunEngine7()) goto stop;  break;
+            case 8:  if (!RunEngine8()) goto stop;  break;
+            /* Engines 5, 6 — not yet implemented */
             }
-            for (int i = 0; i < need; i++) box[i] = tmpA[i];
-            break;
         }
+    }
+
+    /* ── Phase 2: CR engine runs indefinitely (or stop if none) ─── */
+    {
+        int crEngine = 0;
+        for (int i = 1; i <= 4; i++)
+            if (engVars[i] != '0') { crEngine = i; break; }
+        if (!crEngine) goto stop;
+
+        int  mpc        = engVars[12] - '0';
+        int  need       = (mpc == 1) ? 2 : 3;
+        BOOL firstCycle = TRUE;
+
+        for (;;) {
+            int aList[NCELLS], na = 0;
+            int iList[NCELLS], ni = 0;
+            for (int i = 0; i < NCELLS; i++) {
+                if (occ[i]) aList[na++] = i;
+                else        iList[ni++] = i;
+            }
+
+            BOOL ok;
+            switch (crEngine) {
+            case 2: ok = (na >= need-1) && (ni >= 1); break;
+            default: ok = (na >= need); break;
+            }
+            if (!ok) {
+                if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) goto stop;
+                continue;
+            }
+
+            int box[3] = {-1,-1,-1};
+            int tmpA[NCELLS];
+            memcpy(tmpA, aList, na * sizeof(int));
+
+            switch (crEngine) {
+            case 2: {
+                int j = rand() % na;
+                box[0] = tmpA[j];  tmpA[j] = tmpA[--na];
+                box[1] = iList[rand() % ni];
+                if (need == 3) box[2] = tmpA[rand() % na];
+                break;
+            }
+            default: {
+                for (int i = 0; i < need; i++) {
+                    int j = i + rand() % (na - i);
+                    int t = tmpA[i]; tmpA[i] = tmpA[j]; tmpA[j] = t;
+                }
+                for (int i = 0; i < need; i++) box[i] = tmpA[i];
+                break;
+            }
+            }
+
+            int bx[3], by[3];
+            for (int i = 0; i < need; i++) Center(box[i], &bx[i], &by[i]);
+
+            if (firstCycle) {
+                firstCycle = FALSE;
+                SendKey(0x41);  SendKey(0x58);  SendKey(0x58);
+                if (WaitForSingleObject(hStop, 250) == WAIT_OBJECT_0) goto stop;
+            }
+
+            for (int m = 0; m < mpc; m++) {
+                int oi = MV_ORG[m], di = MV_DST[m];
+                DoClick(bx[oi], by[oi]);
+                if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
+                SendKey(0x41);
+                if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
+                DoClick(bx[di], by[di]);
+                if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
+                SendKey(0x41);
+                if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) goto stop;
+            }
+
+            DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+            if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) goto stop;
         }
-
-        /* ── Screen centres for selected boxes ─── */
-        int bx[3], by[3];
-        for (int i = 0; i < need; i++) Center(box[i], &bx[i], &by[i]);
-
-        /* ── One-time cursor reset before first Cycle ─── */
-        if (firstCycle) {
-            firstCycle = FALSE;
-            SendKey(0x41);   /* A */
-            SendKey(0x58);   /* X */
-            SendKey(0x58);   /* X */
-            if (WaitForSingleObject(hStop, 250) == WAIT_OBJECT_0) break; /* pre-move delay */
-        }
-
-        /* ── Execute MPC Moves ─── */
-        for (int m = 0; m < mpc; m++) {
-            int oi = MV_ORG[m];
-            int di = MV_DST[m];
-
-            DoClick(bx[oi], by[oi]);
-            if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
-
-            SendKey(0x41);
-            if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
-
-            DoClick(bx[di], by[di]);
-            if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) goto stop;
-
-            SendKey(0x41);
-
-            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) goto stop;
-        }
-
-        /* ── Cycle complete: click Target Refresh ─── */
-        DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
-        if (WaitForSingleObject(hStop, 400) == WAIT_OBJECT_0) break;
     }
 
 stop:
@@ -661,21 +749,43 @@ LRESULT CALLBACK ProcHook(int code, WPARAM wp, LPARAM lp) {
 ═══════════════════════════════════════════════════════════════ */
 static void StartAuto(void) {
     if (running) return;
-    /* Capture game grid if not yet set */
-    if (!gridSet)             { pendingStart = TRUE; StartCap(1);             return; }
+    /* Grid capture needed only for CR engines and Engine 7 */
+    {
+        BOOL needsGrid = FALSE;
+        for (int i = 1; i <= 4; i++) if (engVars[i] != '0') { needsGrid = TRUE; break; }
+        if (engVars[7] != '0') needsGrid = TRUE;
+        if (engVars[8] != '0') needsGrid = TRUE;
+        if (needsGrid && !gridSet) { pendingStart = TRUE; StartCap(1); return; }
+    }
     /* Capture active target coord if not set */
     if (!tgtSet[activeTgt])   { pendingStart = TRUE; StartCap(2 + activeTgt); return; }
-    /* Determine active engine and check minimum box requirements */
-    int engine = 1;
-    for (int i = 1; i <= 4; i++)
-        if (engVars[i] != '0') { engine = i; break; }
-    int mpc  = engVars[12] - '0';
-    int need = (mpc == 1) ? 2 : 3;
-    int na = 0, ni = 0;
-    for (int i = 0; i < NCELLS; i++) { if (occ[i]) na++; else ni++; }
-    switch (engine) {
-    case 2:  if (na < need-1 || ni < 1) return;  break;
-    default: if (na < need)             return;  break;
+    /* Row button calibration for Engine 8 */
+    if (engVars[8] != '0') {
+        if (!rb1Set) { pendingStart = TRUE; StartCap(7); return; }
+        if (!rb2Set) { pendingStart = TRUE; StartCap(8); return; }
+    }
+    /* Which engines are active? Verify minimums per type. */
+    int crEngine = 0;
+    for (int i = 1; i <= 4; i++) if (engVars[i] != '0') { crEngine = i; break; }
+    BOOL hasFS = FALSE;
+    for (int i = 5; i <= 8; i++) if (engVars[i] != '0') { hasFS = TRUE; break; }
+    if (!crEngine && !hasFS) return;
+
+    if (crEngine) {
+        int mpc  = engVars[12] - '0';
+        int need = (mpc == 1) ? 2 : 3;
+        int na = 0, ni = 0;
+        for (int i = 0; i < NCELLS; i++) { if (occ[i]) na++; else ni++; }
+        switch (crEngine) {
+        case 2:  if (na < need-1 || ni < 1) return;  break;
+        default: if (na < need)             return;  break;
+        }
+    }
+    /* Engine 7 needs at least one active column */
+    if (engVars[7] != '0') {
+        BOOL any = FALSE;
+        for (int i = 0; i < NCELLS; i++) if (occ[i]) { any = TRUE; break; }
+        if (!any) return;
     }
     /* All prerequisites met — launch thread */
     hStop   = CreateEventA(NULL, TRUE, FALSE, NULL);
@@ -742,6 +852,10 @@ LRESULT CALLBACK ProcCap(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             strcpy(txt, "Click  TOP-LEFT  corner of game grid          [Esc = cancel]");
         else if (capMode == 1 && capStep == 1)
             strcpy(txt, "Click  BOTTOM-RIGHT  corner of game grid      [Esc = cancel]");
+        else if (capMode == 7)
+            strcpy(txt, "Click the TOP-LEFT row button (MR1)           [Esc = cancel]");
+        else if (capMode == 8)
+            strcpy(txt, "Click the BOTTOM-RIGHT row button (SR4)       [Esc = cancel]");
         else
             sprintf(txt, "Click the  %s  target location in the game     [Esc = cancel]",
                     tgtLabels[capMode - 2]);
@@ -776,10 +890,16 @@ LRESULT CALLBACK ProcCap(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                     EndCap();  SaveIni();
                 }
             }
-        } else {
+        } else if (capMode >= 2 && capMode <= 6) {
             int ti = capMode - 2;
             tgtX[ti]=pt.x;  tgtY[ti]=pt.y;  tgtSet[ti]=TRUE;
             EndCap();  SaveIni();  InvalidateSect(3);
+        } else if (capMode == 7) {
+            rb1x = pt.x;  rb1y = pt.y;  rb1Set = TRUE;
+            EndCap();  SaveIni();
+        } else if (capMode == 8) {
+            rb2x = pt.x;  rb2y = pt.y;  rb2Set = TRUE;
+            EndCap();  SaveIni();
         }
         return 0;
     }
