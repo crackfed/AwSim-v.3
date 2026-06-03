@@ -766,6 +766,11 @@ DWORD WINAPI AutoRun(LPVOID _u) {
     static const int MV_ORG[5] = { 0, 1, 2, 0, 1 };
     static const int MV_DST[5] = { 1, 2, 0, 1, 2 };
 
+    /* Focus the game tab first — double-click the Target refresh area so
+       subsequent SendKey input is delivered to the game, not the desktop. */
+    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) goto stop;
+
     /* ── Phase 1: FS engines in run-order value (1 = first) ─── */
     for (int ord = 1; ord <= 5; ord++) {
         for (int fsi = 3; fsi <= 7; fsi++) {
