@@ -25,8 +25,8 @@
  *   [1..2]  = CR engines (mutually exclusive):
  *               [1]=AwSim  [2]=Decoy        0=off, else=run-order rank
  *   [3..7]  = FS engines (ranked by selection order):
- *               [3]=Quick Opt [4]=Scout DZ [5]=Col.Ops
- *               [6]=Row Ops   [7]=Row Swap  0=off, 1-6=run-order rank
+ *               [3]=Permute Rows [4]=Scout DZ [5]=Col.Ops
+ *               [6]=Row Ops   [7]=Quick Opt  0=off, 1-6=run-order rank
  *   [8..10] = Overdrive flags: [8]=Scout DZ [9]=Col.Ops [10]=Row Ops
  *   [11]    = MPC '1'..'5'
  *   Default: ".10000000003"
@@ -41,6 +41,7 @@
  */
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -73,6 +74,7 @@
 #define WM_STOPAUTO    (WM_APP + 1)
 #define WM_EXITAPP     (WM_APP + 2)
 #define WM_STARTDEFER  (WM_APP + 3)
+#define WM_XEROXDEFER  (WM_APP + 4)
 
 /* ── Button flash IDs (bit positions in flashMask) ──────────── */
 #define FLASH_VIEW   (1u<<0)   /* Sec1 <View>  (both < and >)     */
@@ -83,12 +85,10 @@
 #define FLASH_MPC    (1u<<5)   /* Sec2 MPC + button                */
 #define FLASH_DN     (1u<<6)   /* Sec2 #/. toggle                  */
 #define FLASH_RST    (1u<<7)   /* Sec2 Reset button                */
-#define FLASH_S3B1   (1u<<8)   /* Sec3 All-On  button            */
-#define FLASH_S3B2   (1u<<9)   /* Sec3 Left-5  button            */
-#define FLASH_S3B3   (1u<<10)  /* Sec3 Right-5 button            */
-#define FLASH_S3B4   (1u<<11)  /* Sec3 All-Off button            */
-#define FLASH_S3B5   (1u<<12)  /* Sec3 Save    button            */
-#define FLASH_S3B6   (1u<<13)  /* Sec3 Load    button            */
+#define FLASH_S3B1   (1u<<8)   /* Sec3 Save           button      */
+#define FLASH_S3B2   (1u<<9)   /* Sec3 Load           button      */
+#define FLASH_S3B3   (1u<<10)  /* Sec3 Toggle Presets button      */
+#define FLASH_S3B4   (1u<<11)  /* Sec3 XEROX          button      */
 #define IDT_FLASH    1         /* WM_TIMER ID for flash clear      */
 
 /* ═══════════════════════════════════════════════════════════════
@@ -109,27 +109,30 @@
 #define S2_CR_XA      8   /* click x left  bound               */
 #define S2_CR_XB    177   /* click x right bound               */
 /* FS: 5 buttons at shared x, row centres                     */
-#define S2_FS_CX    234   /* indicator draw x                  */
-static const int S2_CY[5] = { 17, 42, 67, 92, 117 };
+#define S2_FS_CX    243   /* indicator draw x (was 234, +9)    */
+static const int S2_CY[5] = { 17, 43, 69, 95, 121 };
 #define S2_FS_XA    185   /* click x left  bound               */
 #define S2_FS_XB    439   /* click x right bound (OD starts 440) */
 /* Overdrive diamonds: 3, for FS2/FS3/FS4 (rows 1,2,3)       */
-#define S2_OD_CX    459   /* indicator draw x                  */
+#define S2_OD_CX    466   /* indicator draw x (was 459, +7)    */
 #define S2_OD_XA    440   /* click x left  bound               */
 #define S2_OD_XB    478   /* click x right bound               */
 #define S2_ROW_YTOL  12   /* ±px tolerance from row centre     */
 /* number/dot toggle button (far-right top box)              */
 #define S2_DN_X1    521
 #define S2_DN_X2    559
-#define S2_DN_Y1     14
-#define S2_DN_Y2     52
+#define S2_DN_Y1     16
+#define S2_DN_Y2     54
 /* Reset button (far-right bottom box)                         */
 #define S2_RST_X1   521
 #define S2_RST_X2   559
-#define S2_RST_Y1    79
-#define S2_RST_Y2   117
-/* MPC+ button — diamond flash, half-diag = S2_MPC_R          */
-#define S2_MPC_CX    42
+#define S2_RST_Y1    80
+#define S2_RST_Y2   118
+/* MPC+ button — diamond flash, half-diag = S2_MPC_R.
+   The + button and the digit display swapped sides: the + button (and its
+   click hotspot) is now on the right; the digit display is on the left.  */
+#define S2_MPC_CX   152   /* + button centre                   */
+#define S2_MPCDIG_CX 33   /* digit-display diamond centre      */
 #define S2_MPC_CY    87
 #define S2_MPC_R     15
 #define S2_MPC_X1   (S2_MPC_CX - S2_MPC_R)
@@ -147,13 +150,16 @@ static const int S3_CX2[9] = {  71, 133, 195, 257, 319, 381, 443, 505, 567 };
 static const int S3_RY1[4] = {   3,  26,  49,  72 };
 static const int S3_RY2[4] = {  25,  48,  71,  94 };
 /* Column-toggle click strip (no overlay drawn)                 */
-#define S3_TOG_Y1   97
-#define S3_TOG_Y2  112
-/* 6 bottom action buttons — moved 2px up, 1px taller           */
-static const int S3_BTN_X1[6] = { 23, 113, 203, 293, 383, 473 };
-static const int S3_BTN_X2[6] = {106, 196, 286, 376, 466, 556 };
-#define S3_BTN_Y1  113
-#define S3_BTN_Y2  131
+/* Column-toggle strip: thin band along the very top, above the boxgrid.
+   Click above column c to toggle that whole column.                */
+#define S3_TOG_Y1    0
+#define S3_TOG_Y2    4
+/* 4 action buttons below the boxgrid: Save, Load, Toggle Presets, XEROX.
+   XEROX sits apart on the right and is slightly taller.            */
+static const int S3_BTN_X1[4] = {  55, 179, 303, 425 };
+static const int S3_BTN_X2[4] = { 140, 264, 388, 525 };
+static const int S3_BTN_Y1[4] = { 110, 110, 110, 106 };
+static const int S3_BTN_Y2[4] = { 130, 130, 130, 134 };
 
 /* Section 4 – Targets ─────────────────────────────────────── */
 static const int S4_X1[5] = {   8, 122, 236, 350, 464 };
@@ -199,7 +205,7 @@ static int   tgtClickCnt[NTGTS];
 static int  rb1x, rb1y;          /* MR1 centre — top-left  button */
 static int  rb2x, rb2y;          /* SR4 centre — bot-right button */
 static BOOL rb1Set = FALSE, rb2Set = FALSE;
-/* Row Swap calibration (Engine 7 = FS5) ─────────────────────── */
+/* Permute Rows (swap) calibration (Engine 3 = FS1) ──────────── */
 static int  rs12x, rs12y;        /* Swap rows 1-2 button centre   */
 static int  rs34x, rs34y;        /* Swap rows 3-4 button centre   */
 static BOOL rs12Set = FALSE, rs34Set = FALSE;
@@ -222,6 +228,7 @@ static int   capMode     = 0;   /* 1=grid  2..6=target 0..4    */
 static int   capStep     = 0;
 static POINT capP1;
 static BOOL  pendingStart = FALSE;
+static BOOL  pendingXerox = FALSE;
 
 /* INI ───────────────────────────────────────────────────────── */
 static char iniPath[MAX_PATH];
@@ -237,6 +244,7 @@ static void InvalidateSect(int n);
 static void SaveIni(void);
 static void LoadIni(void);
 static void StartAuto(void);
+static void StartXerox(void);
 static void StopAuto(void);
 static void StartCap(int mode);
 static void EndCap(void);
@@ -244,6 +252,8 @@ static void FlashBtn(DWORD bits, int sect);
 static void Center(int idx, int *ox, int *oy);
 static void DoClick(int x, int y);
 static void DoDbl(int x, int y);
+static void SendKey(WORD vk);
+static void FocusGameTab(void);
 LRESULT CALLBACK ProcMain(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK ProcCap (HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK ProcHook(int, WPARAM, LPARAM);
@@ -276,70 +286,118 @@ static void IniGetStr(const char *k, const char *def, char *out, int sz) {
 static void SaveIni(void) {
     if (!wMain) return;
     RECT wr; GetWindowRect(wMain, &wr);
-    IniSetInt("_WindowX", wr.left);
-    IniSetInt("_WindowY", wr.top);
-    IniSetStr("_Version",    APP_VER);
-    IniSetInt("_ViewState",  viewState);
-    IniSetStr("_EngineVars", engVars);
-    IniSetInt("_CycleState", cycleState);
-    IniSetInt("_ActiveTarget", activeTgt);
-    IniSetInt("_GridX", gx);  IniSetInt("_GridY", gy);
-    IniSetInt("_GridW", gw);  IniSetInt("_GridH", gh);
-    IniSetInt("_GridSet", gridSet ? 1 : 0);
-    char key[32];
+
+    IniSetStr("_Author",       "crackfed");
+    IniSetStr("_AwSimVersion", APP_VER);
+    IniSetInt("_Window-X",     wr.left);
+    IniSetInt("_Window-Y",     wr.top);
+    IniSetInt("_View",         viewState);
+
+    /* engVars is split across three keys:
+       [0]=selection style, [1..10]=engine ranks, [11]=moves-per-cycle */
+    char sel[2] = { engVars[0], '\0' };
+    IniSetStr("_SelectionStyle", sel);
+    char eng[11];
+    memcpy(eng, engVars + 1, 10);  eng[10] = '\0';
+    IniSetStr("_Engines", eng);
+    char mpc[2] = { engVars[11], '\0' };
+    IniSetStr("_MovesPerCycle", mpc);
+
+    /* Current grid (Formation) and the SAVE-button snapshot (FormationSaved) */
+    char f[NCELLS + 1];
+    for (int i = 0; i < NCELLS; i++) f[i] = occ[i] ? '1' : '0';
+    f[NCELLS] = '\0';
+    IniSetStr("_Formation", f);
+    for (int i = 0; i < NCELLS; i++) f[i] = customOcc[i] ? '1' : '0';
+    IniSetStr("_FormationSaved", f);
+
+    /* Active target stored as its label (CY/DF/Deff/CC/CY*) */
+    IniSetStr("_Target", tgtLabels[activeTgt]);
+
+    /* Target coordinates (0 = unconfigured; no separate Set flag) */
+    static const char *TGTKEY[NTGTS] = {
+        "_TargetCY", "_TargetDF", "_TargetDeff", "_TargetCC", "_TargetCY*"
+    };
+    char key[40];
     for (int i = 0; i < NTGTS; i++) {
-        sprintf(key, "_Tgt%cX",   'A'+i); IniSetInt(key, tgtX[i]);
-        sprintf(key, "_Tgt%cY",   'A'+i); IniSetInt(key, tgtY[i]);
-        sprintf(key, "_Tgt%cSet", 'A'+i); IniSetInt(key, tgtSet[i]?1:0);
+        sprintf(key, "%s-X", TGTKEY[i]); IniSetInt(key, tgtX[i]);
+        sprintf(key, "%s-Y", TGTKEY[i]); IniSetInt(key, tgtY[i]);
     }
-    IniSetInt("_Rb1X", rb1x);  IniSetInt("_Rb1Y", rb1y);
-    IniSetInt("_Rb1Set", rb1Set ? 1 : 0);
-    IniSetInt("_Rb2X", rb2x);  IniSetInt("_Rb2Y", rb2y);
-    IniSetInt("_Rb2Set", rb2Set ? 1 : 0);
-    IniSetInt("_Rs12X", rs12x); IniSetInt("_Rs12Y", rs12y);
-    IniSetInt("_Rs12Set", rs12Set ? 1 : 0);
-    IniSetInt("_Rs34X", rs34x); IniSetInt("_Rs34Y", rs34y);
-    IniSetInt("_Rs34Set", rs34Set ? 1 : 0);
-    char s[NCELLS+1];
-    for (int i = 0; i < NCELLS; i++) s[i] = customOcc[i] ? '1' : '0';
-    s[NCELLS] = '\0';
-    IniSetStr("_CustomOcc", s);
+
+    /* Boxgrid + button calibration (0 = unconfigured; no separate Set flag) */
+    IniSetInt("_BoxGrid-X",       gx);
+    IniSetInt("_BoxGrid-Y",       gy);
+    IniSetInt("_BoxGridWidth",    gw);
+    IniSetInt("_BoxGridHeight",   gh);
+    IniSetInt("_BtnRow1Mirror-X", rb1x);
+    IniSetInt("_BtnRow1Mirror-Y", rb1y);
+    IniSetInt("_BtnRow4RShift-X", rb2x);
+    IniSetInt("_BtnRow4RShift-Y", rb2y);
+    IniSetInt("_BtnSwapRows12-X", rs12x);
+    IniSetInt("_BtnSwapRows12-Y", rs12y);
+    IniSetInt("_BtnSwapRows34-X", rs34x);
+    IniSetInt("_BtnSwapRows34-Y", rs34y);
 }
 
 static void LoadIni(void) {
-    winSX      = IniGetInt("_WindowX",      INI_UNSET);
-    winSY      = IniGetInt("_WindowY",      INI_UNSET);
-    viewState  = IniGetInt("_ViewState",    0);
+    winSX     = IniGetInt("_Window-X", INI_UNSET);
+    winSY     = IniGetInt("_Window-Y", INI_UNSET);
+    viewState = IniGetInt("_View", 0);
     if (viewState < 0 || viewState > 5) viewState = 0;
-    IniGetStr("_EngineVars", ".10000000003", engVars, sizeof engVars);
-    if (strlen(engVars) < 12 || (engVars[0]!='.' && engVars[0]!='#'))
-        strcpy(engVars, ".10000000003");
-    cycleState = IniGetInt("_CycleState",   0);
-    if (cycleState < 0 || cycleState > 4) cycleState = 0;
-    activeTgt  = IniGetInt("_ActiveTarget", 0);
-    if (activeTgt < 0 || activeTgt >= NTGTS) activeTgt = 0;
-    gx = IniGetInt("_GridX", 0);  gy = IniGetInt("_GridY", 0);
-    gw = IniGetInt("_GridW", 0);  gh = IniGetInt("_GridH", 0);
-    gridSet = IniGetInt("_GridSet", 0) ? TRUE : FALSE;
-    char key[32];
+
+    /* Reassemble engVars[0..11] from the three split keys */
+    char sel[8], eng[16], mpc[8];
+    IniGetStr("_SelectionStyle", ".",          sel, sizeof sel);
+    IniGetStr("_Engines",        "1000000000", eng, sizeof eng);
+    IniGetStr("_MovesPerCycle",  "3",          mpc, sizeof mpc);
+    if (sel[0] != '.' && sel[0] != '#') sel[0] = '.';
+    if (strlen(eng) < 10)               strcpy(eng, "1000000000");
+    if (mpc[0] < '1' || mpc[0] > '5')   mpc[0] = '3';
+    engVars[0] = sel[0];
+    memcpy(engVars + 1, eng, 10);
+    engVars[11] = mpc[0];
+    engVars[12] = '\0';
+
+    /* Current grid (Formation) loaded directly; SAVE snapshot separately */
+    char f[NCELLS + 2] = "";
+    IniGetStr("_Formation", "", f, sizeof f);
+    int fl = (int)strlen(f);
+    for (int i = 0; i < NCELLS; i++) occ[i] = (i < fl && f[i] == '1');
+    IniGetStr("_FormationSaved", "", f, sizeof f);
+    fl = (int)strlen(f);
+    for (int i = 0; i < NCELLS; i++) customOcc[i] = (i < fl && f[i] == '1');
+    cycleState = 0;   /* grid loaded directly; start in custom (non-preset) mode */
+
+    /* Active target — match the saved label back to its index */
+    char tg[16];
+    IniGetStr("_Target", "CY", tg, sizeof tg);
+    activeTgt = 0;
+    for (int i = 0; i < NTGTS; i++)
+        if (strcmp(tg, tgtLabels[i]) == 0) { activeTgt = i; break; }
+
+    /* Target coordinates (0 = unconfigured); Set flag derived from coords */
+    static const char *TGTKEY[NTGTS] = {
+        "_TargetCY", "_TargetDF", "_TargetDeff", "_TargetCC", "_TargetCY*"
+    };
+    char key[40];
     for (int i = 0; i < NTGTS; i++) {
-        sprintf(key, "_Tgt%cX",   'A'+i); tgtX[i]  = IniGetInt(key, -1);
-        sprintf(key, "_Tgt%cY",   'A'+i); tgtY[i]  = IniGetInt(key, -1);
-        sprintf(key, "_Tgt%cSet", 'A'+i); tgtSet[i] = IniGetInt(key,0)?TRUE:FALSE;
+        sprintf(key, "%s-X", TGTKEY[i]); tgtX[i] = IniGetInt(key, 0);
+        sprintf(key, "%s-Y", TGTKEY[i]); tgtY[i] = IniGetInt(key, 0);
+        tgtSet[i] = (tgtX[i] != 0 || tgtY[i] != 0);
     }
-    rb1x = IniGetInt("_Rb1X", 0);  rb1y = IniGetInt("_Rb1Y", 0);
-    rb1Set = IniGetInt("_Rb1Set", 0) ? TRUE : FALSE;
-    rb2x = IniGetInt("_Rb2X", 0);  rb2y = IniGetInt("_Rb2Y", 0);
-    rb2Set = IniGetInt("_Rb2Set", 0) ? TRUE : FALSE;
-    rs12x = IniGetInt("_Rs12X", 0); rs12y = IniGetInt("_Rs12Y", 0);
-    rs12Set = IniGetInt("_Rs12Set", 0) ? TRUE : FALSE;
-    rs34x = IniGetInt("_Rs34X", 0); rs34y = IniGetInt("_Rs34Y", 0);
-    rs34Set = IniGetInt("_Rs34Set", 0) ? TRUE : FALSE;
-    char s[NCELLS+2] = "";
-    IniGetStr("_CustomOcc", "", s, sizeof s);
-    int slen = (int)strlen(s);
-    for (int i = 0; i < NCELLS; i++)
-        customOcc[i] = (i < slen && s[i]=='1') ? TRUE : FALSE;
+
+    /* Boxgrid + button calibration; Set flags derived from nonzero coords */
+    gx = IniGetInt("_BoxGrid-X", 0);     gy = IniGetInt("_BoxGrid-Y", 0);
+    gw = IniGetInt("_BoxGridWidth", 0);  gh = IniGetInt("_BoxGridHeight", 0);
+    gridSet = (gx != 0 || gy != 0);
+    rb1x = IniGetInt("_BtnRow1Mirror-X", 0);  rb1y = IniGetInt("_BtnRow1Mirror-Y", 0);
+    rb1Set = (rb1x != 0 || rb1y != 0);
+    rb2x = IniGetInt("_BtnRow4RShift-X", 0);  rb2y = IniGetInt("_BtnRow4RShift-Y", 0);
+    rb2Set = (rb2x != 0 || rb2y != 0);
+    rs12x = IniGetInt("_BtnSwapRows12-X", 0); rs12y = IniGetInt("_BtnSwapRows12-Y", 0);
+    rs12Set = (rs12x != 0 || rs12y != 0);
+    rs34x = IniGetInt("_BtnSwapRows34-X", 0); rs34y = IniGetInt("_BtnSwapRows34-Y", 0);
+    rs34Set = (rs34x != 0 || rs34y != 0);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -482,6 +540,188 @@ static void ApplyCycle(int state) {
     InvalidateSect(2);
 }
 
+/* Toggle Presets button: cycle the grid through 5 presets each click.
+   0=All  1=None  2=Left 5 cols  3=Right 5 cols  4=Top 2 rows.       */
+static int presetIdx = -1;
+static void TogglePresets(void) {
+    presetIdx = (presetIdx + 1) % 5;
+    for (int i = 0; i < NCELLS; i++) {
+        int c = i % GCOLS, r = i / GCOLS;
+        switch (presetIdx) {
+        case 0: occ[i] = TRUE;            break;   /* All           */
+        case 1: occ[i] = FALSE;           break;   /* None          */
+        case 2: occ[i] = (c < 5);         break;   /* Left 5 cols   */
+        case 3: occ[i] = (c >= GCOLS-5);  break;   /* Right 5 cols  */
+        case 4: occ[i] = (r < 2);         break;   /* Top 2 rows    */
+        }
+    }
+    InvalidateSect(2);
+    SaveIni();
+}
+
+/* ── Windows Magnifier (Magnify.exe) helpers ──────────────────
+   XEROX only captures correctly when the screen is at true 1:1 scale,
+   so if Magnifier is running and zoomed in, XEROX drops it to 100% for
+   the scan and restores the previous zoom afterwards.                  */
+static BOOL MagnifierRunning(void) {
+    BOOL found = FALSE;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;  pe.dwSize = sizeof pe;
+        if (Process32First(snap, &pe)) {
+            do {
+                if (_stricmp(pe.szExeFile, "Magnify.exe") == 0) { found = TRUE; break; }
+            } while (Process32Next(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    return found;
+}
+static int MagRegDword(const char *value, int def) {
+    HKEY k;  DWORD v = def, sz = sizeof v, ty = REG_DWORD;
+    if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Microsoft\\ScreenMagnifier",
+                      0, KEY_READ, &k) == ERROR_SUCCESS) {
+        RegQueryValueExA(k, value, NULL, &ty, (LPBYTE)&v, &sz);
+        RegCloseKey(k);
+    }
+    return (int)v;
+}
+/* Win + (numpad +/-): dir>0 zoom in, dir<0 zoom out. */
+static void MagZoomKey(int dir) {
+    WORD vk = (dir > 0) ? VK_ADD : VK_SUBTRACT;
+    keybd_event(VK_LWIN, 0, 0, 0);                 Sleep(20);
+    keybd_event(vk, 0, 0, 0);
+    keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);        Sleep(20);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);   Sleep(120);
+}
+
+/* XEROX: copy the game's current formation into the boxgrid.
+   A unit normally shows NO bolt; a bolt means that unit is disabled.
+   XEROX detects every occupied box while leaving any already-disabled
+   units disabled and excluding them from the formation:
+     - scan #1 (before 'z') records which units are already disabled
+     - 'z' disables all, scan #2 records every occupied box, 'z' re-enables
+     - the already-disabled units are re-disabled via the 'x' selective
+       toggle so the game state is unchanged
+     - occ = (all occupied) AND NOT (initially disabled)                  */
+#define XEROX_THRESHOLD  2   /* bright-white sample hits per cell (tune) */
+
+/* Focus the game's browser tab WITHOUT clicking (so no unit/mirror state
+   is disturbed): find the top-level window sitting under the boxgrid and
+   bring it to the foreground. Used wherever tab focus is needed before
+   sending keys. */
+static void FocusGameTab(void) {
+    if (!gridSet) return;
+    POINT p;  p.x = gx + gw / 2;  p.y = gy + gh / 2;
+    HWND root = GetAncestor(WindowFromPoint(p), GA_ROOT);
+    if (!root || root == wMain) return;
+    SetForegroundWindow(root);
+    Sleep(300);
+}
+
+/* Capture the calibrated grid region and flag each cell whose bolt area
+   holds at least XEROX_THRESHOLD bright-white pixels. The disabled bolt is
+   a thin element on the far-right edge, so only the RIGHT 1/8 (width) of
+   the LOWER HALF (height) is sampled — this ignores the lighter unit art
+   and the top-left star/number labels, keying purely on the bolt. */
+static void XeroxScan(BOOL *out) {
+    HDC scr = GetDC(NULL);
+    HDC mem = CreateCompatibleDC(scr);
+    HBITMAP bm = CreateCompatibleBitmap(scr, gw, gh);
+    HBITMAP ob = (HBITMAP)SelectObject(mem, bm);
+    BitBlt(mem, 0, 0, gw, gh, scr, gx, gy, SRCCOPY);
+    int cellW = gw / GCOLS, cellH = gh / GROWS;
+    for (int i = 0; i < NCELLS; i++) {
+        int c = i % GCOLS, r = i / GCOLS;
+        int xL = c * cellW + (cellW * 7) / 8, xR = c * cellW + cellW - 2;
+        int yT = r * cellH + cellH / 2,       yB = r * cellH + cellH - 2;
+        int hits = 0;
+        for (int yy = yT; yy < yB; yy++)
+            for (int xx = xL; xx < xR; xx++) {
+                COLORREF px = GetPixel(mem, xx, yy);
+                if (GetRValue(px) > 210 && GetGValue(px) > 210 && GetBValue(px) > 210)
+                    hits++;
+            }
+        out[i] = (hits >= XEROX_THRESHOLD);
+    }
+    SelectObject(mem, ob);
+    DeleteObject(bm);  DeleteDC(mem);  ReleaseDC(NULL, scr);
+}
+
+static void XeroxFormation(void) {
+    if (!gridSet) return;   /* StartXerox ensures the grid is calibrated */
+
+    /* Remember where the cursor was (the XEROX button) to restore later. */
+    POINT savePos;  GetCursorPos(&savePos);
+
+    /* If Magnifier is running and zoomed past 100%, drop it to 100% so the
+       screen capture is at true 1:1 scale; remember how far to restore. */
+    BOOL mag = MagnifierRunning();
+    int  magSteps = 0;
+    if (mag) {
+        int zoom = MagRegDword("Magnification", 100);
+        int inc  = MagRegDword("ZoomIncrement", 100);
+        if (inc  < 5)   inc  = 100;
+        if (zoom > 100) {
+            magSteps = (zoom - 100 + inc - 1) / inc;             /* ceil */
+            for (int i = 0; i < magSteps + 3; i++) MagZoomKey(-1); /* clamp@100 */
+            Sleep(200);
+        }
+    }
+
+    /* Scan #1: record which units are ALREADY disabled (bolt present now).
+       Done BEFORE focus — it is only a screen read, so it captures the
+       pristine grid before anything can disturb it. */
+    BOOL preDis[NCELLS];
+    XeroxScan(preDis);
+    int nPre = 0;
+    for (int i = 0; i < NCELLS; i++) if (preDis[i]) nPre++;
+
+    /* Focus the game tab (no click — leaves all unit/mirror state intact). */
+    FocusGameTab();
+
+    /* Deactivate all units → every occupied box shows a bolt. */
+    SendKey('Z');
+    Sleep(800);                 /* allow the (low-fps) game to render them   */
+
+    /* Scan #2: record every occupied box. */
+    BOOL allUnits[NCELLS];
+    XeroxScan(allUnits);
+
+    /* Reactivate all units to restore the normal (bolt-free) state. */
+    SendKey('Z');
+    Sleep(100);
+
+    /* Restore Magnifier zoom (clicks below use true screen coords, so they
+       are unaffected by Magnifier display zoom). */
+    for (int i = 0; i < magSteps; i++) MagZoomKey(+1);
+
+    /* Re-disable only the units that were ALREADY disabled at the start.
+       If none were, skip the selective-toggle entirely (no 'x', no clicks). */
+    if (nPre > 0) {
+        SendKey('X');                 /* enter selective toggle               */
+        Sleep(300);
+        for (int i = 0; i < NCELLS; i++) {
+            if (!preDis[i]) continue;
+            int cx, cy;  Center(i, &cx, &cy);
+            DoClick(cx, cy);          /* enabled now → click re-disables it    */
+            Sleep(150);
+        }
+        SendKey('X');                 /* leave selective toggle               */
+        Sleep(200);
+    }
+
+    /* Formation = every occupied box EXCEPT those initially disabled. */
+    for (int i = 0; i < NCELLS; i++)
+        occ[i] = (allUnits[i] && !preDis[i]);
+
+    /* Redraw the boxgrid overlay and tidy up; cursor returns to XEROX. */
+    SetCursorPos(savePos.x, savePos.y);
+    InvalidateSect(2);
+    SaveIni();
+    SetForegroundWindow(wMain);   /* bring AwSim back to the front */
+}
+
 static void ColToggle(int col) {
     /* If any cell in this column is active → deactivate all.
        If all are inactive → activate all.                         */
@@ -560,7 +800,7 @@ static BOOL ColIsActive(int col) {
     return FALSE;
 }
 
-/* ── Engine 3: Quick Opt (FS1) — 90-second time-limited cycle ── */
+/* ── Engine 7: Quick Optimize (FS5) — 90-second time-limited cycle ── */
 static BOOL RunQuickOpt(void) {
     DWORD t0   = GetTickCount();
     DWORD tLim = 90000;   /* 90 s */
@@ -626,10 +866,7 @@ static BOOL RunQuickOpt(void) {
 
 /* ── Engine 4: Scout DZ (FS2) — fixed keystroke sequence ─────── */
 static BOOL RunScoutDZ(void) {
-    /* Click Target first to ensure game window has focus */
-    DoClick(tgtX[activeTgt], tgtY[activeTgt]);
-    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
-
+    /* Game focus is already established by AutoRun's opening double-click. */
 #define E4K(vk) do { SendKey(vk); \
     if (WaitForSingleObject(hStop,3333)==WAIT_OBJECT_0) return FALSE; } while(0)
 
@@ -717,21 +954,19 @@ static BOOL RowOpsPass(void) {
 /* Engine 6: one pass, repeated once more if Overdrive is on. */
 static BOOL RunRowOps(void) {
     BOOL ext = (engVars[10] != '0');   /* OD for FS4 Row Ops = Overdrive */
-    /* Single click on Target to give the game window focus before the
-       first action — without it the opening DoDbl lands as one click. */
-    DoClick(tgtX[activeTgt], tgtY[activeTgt]);
-    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
+    /* Game focus and double-click priming are already done by AutoRun's
+       opening double-click, so RowOpsPass can start directly. */
     if (!RowOpsPass()) return FALSE;
     if (ext && !RowOpsPass()) return FALSE;
     return TRUE;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ENGINE 7  — Row Swap (FS5)
+   ENGINE 3  — Permute Rows (FS1)
    Calibrate two buttons (Swap 1-2, Swap 3-4); Swap 2-3 is their
    midpoint. Run a fixed 23-step swap sequence, then a refresh.
 ═══════════════════════════════════════════════════════════════ */
-static BOOL RunRowSwap(void) {
+static BOOL RunPermuteRows(void) {
     /* rs23 derived as midpoint of rs12 and rs34 */
     int bx[3] = { rs12x, (rs12x+rs34x)/2, rs34x };
     int by[3] = { rs12y, (rs12y+rs34y)/2, rs34y };
@@ -766,9 +1001,14 @@ DWORD WINAPI AutoRun(LPVOID _u) {
     static const int MV_ORG[5] = { 0, 1, 2, 0, 1 };
     static const int MV_DST[5] = { 1, 2, 0, 1, 2 };
 
-    /* Focus the game tab first — double-click the Target refresh area so
-       subsequent SendKey input is delivered to the game, not the desktop. */
-    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+    /* Let the window finish minimising and the game tab regain focus
+       before clicking — otherwise the focusing double-click is lost to
+       the minimise transition and SendKey input goes nowhere. */
+    if (WaitForSingleObject(hStop, 400) == WAIT_OBJECT_0) goto stop;
+
+    /* Focus the game tab (no click) so subsequent SendKey input is
+       delivered to the game, not the desktop. */
+    FocusGameTab();
     if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) goto stop;
 
     /* ── Phase 1: FS engines in run-order value (1 = first) ─── */
@@ -776,11 +1016,11 @@ DWORD WINAPI AutoRun(LPVOID _u) {
         for (int fsi = 3; fsi <= 7; fsi++) {
             if ((engVars[fsi] - '0') != ord) continue;
             switch (fsi) {
-            case 3:  if (!RunQuickOpt()) goto stop; break;  /* Quick Opt  */
+            case 3:  if (!RunPermuteRows()) goto stop; break;  /* Permute Rows   */
             case 4:  if (!RunScoutDZ())  goto stop; break;  /* Scout DZ   */
             case 5:  if (!RunColOps())   goto stop; break;  /* Col.Ops    */
             case 6:  if (!RunRowOps())   goto stop; break;  /* Row Ops    */
-            case 7:  if (!RunRowSwap())  goto stop; break;  /* Row Swap   */
+            case 7:  if (!RunQuickOpt())  goto stop; break;  /* Quick Optimize */
             }
         }
     }
@@ -892,20 +1132,20 @@ static void StartAuto(void) {
     {
         BOOL needsGrid = FALSE;
         for (int i = 1; i <= 2; i++) if (engVars[i] != '0') { needsGrid = TRUE; break; }
-        if (engVars[3] != '0') needsGrid = TRUE;  /* Quick Opt  */
+        if (engVars[7] != '0') needsGrid = TRUE;  /* Quick Opt (E7) */
         if (engVars[5] != '0') needsGrid = TRUE;  /* Col.Ops   */
         if (engVars[6] != '0') needsGrid = TRUE;  /* Row Ops   */
         if (needsGrid && !gridSet) { pendingStart = TRUE; StartCap(1); return; }
     }
     /* Capture active target coord if not set */
     if (!tgtSet[activeTgt])   { pendingStart = TRUE; StartCap(2 + activeTgt); return; }
-    /* Row button calibration for Quick Opt (E3) and Row Ops (E6) */
-    if (engVars[3] != '0' || engVars[6] != '0') {
+    /* Row button calibration for Quick Opt (E7) and Row Ops (E6) */
+    if (engVars[7] != '0' || engVars[6] != '0') {
         if (!rb1Set) { pendingStart = TRUE; StartCap(7); return; }
         if (!rb2Set) { pendingStart = TRUE; StartCap(8); return; }
     }
-    /* Row Swap calibration (E7 = FS5) */
-    if (engVars[7] != '0') {
+    /* Permute Rows (swap) calibration (E3 = FS1) */
+    if (engVars[3] != '0') {
         if (!rs12Set) { pendingStart = TRUE; StartCap(9);  return; }
         if (!rs34Set) { pendingStart = TRUE; StartCap(10); return; }
     }
@@ -985,7 +1225,19 @@ static void EndCap(void) {
     if (pendingStart) {
         pendingStart = FALSE;
         PostMessage(wMain, WM_STARTDEFER, 0, 0);
+    } else if (pendingXerox) {
+        pendingXerox = FALSE;
+        PostMessage(wMain, WM_XEROXDEFER, 0, 0);
     }
+}
+
+/* XEROX entry point: ensure the boxgrid is calibrated (capturing it if
+   missing) before running the copy. The capture re-enters here via
+   WM_XEROXDEFER once done. Focus is windowless, so no row-button setup. */
+static void StartXerox(void) {
+    if (running) return;
+    if (!gridSet) { pendingXerox = TRUE; StartCap(1); return; }
+    XeroxFormation();
 }
 
 LRESULT CALLBACK ProcCap(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1064,7 +1316,7 @@ LRESULT CALLBACK ProcCap(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) { pendingStart = FALSE; EndCap(); }
+        if (wp == VK_ESCAPE) { pendingStart = FALSE; pendingXerox = FALSE; EndCap(); }
         return 0;
 
     case WM_SETCURSOR:
@@ -1232,13 +1484,13 @@ static void DrawCheck(HDC dc, int x1, int y1, int x2, int y2) {
  */
 static void DrawMpcSeg(HDC dc, int val) {
     static const RECT SEG[7] = {
-        {140,81,145,82},   /* 0 TOP */
-        {140,87,145,88},   /* 1 MID */
-        {140,93,145,94},   /* 2 BOT */
-        {139,82,140,87},   /* 3 TL  */
-        {145,82,146,87},   /* 4 TR  */
-        {139,88,140,93},   /* 5 BL  */
-        {145,88,146,93},   /* 6 BR  */
+        {31,81,36,82},   /* 0 TOP */
+        {31,87,36,88},   /* 1 MID */
+        {31,93,36,94},   /* 2 BOT */
+        {30,82,31,87},   /* 3 TL  */
+        {36,82,37,87},   /* 4 TR  */
+        {30,88,31,93},   /* 5 BL  */
+        {36,88,37,93},   /* 6 BR  */
     };
     /* TOP MID BOT TL TR BL BR  for digits 1-5 */
     static const BYTE MASK[5][7] = {
@@ -1320,10 +1572,11 @@ static void DrawDyn1(HDC dc) {
 static void DrawDyn2(HDC dc) {
     BOOL dot = (engVars[0] == '.');
 
-    /* CR indicators: AwSim (row cy=58), Decoy (row cy=117) */
-    static const int CR_CY[2] = { S2_CR1_Y, S2_CR2_Y };
+    /* CR indicators: AwSim (x+4, y-2) and Decoy (x+119, moved right) */
+    static const int CR_CX[2] = { S2_CR_CX + 4, S2_CR_CX + 123 };
+    static const int CR_CY[2] = { S2_CR1_Y - 2, S2_CR2_Y + 1 };
     for (int r = 0; r < 2; r++)
-        DrawIndicator(dc, S2_CR_CX, CR_CY[r] - 3 + (dot ? 1 : 0),
+        DrawIndicator(dc, CR_CX[r], CR_CY[r] - 3 + (dot ? 1 : 0),
                       engVars[r+1] - '0', dot);
 
     /* FS indicators: 5 buttons; Overdrive diamonds for rows 1-3 */
@@ -1339,13 +1592,13 @@ static void DrawDyn2(HDC dc) {
     if (engVars[1] != '0' || engVars[2] != '0')
         DrawMpcSeg(dc, engVars[11] - '0');
 
-    /* MPC+ flash: CC470C diamond outline, half-diag = S2_MPC_R
-       Two diamonds: one over the + button (cx=42), one over the digit (cx=143) */
+    /* MPC+ flash: CC470C diamond outline, half-diag = S2_MPC_R.
+       One over the + button (right), one over the digit display (left). */
     if (flashMask & FLASH_MPC) {
         HPEN   pen = CreatePen(PS_SOLID, 1, RGB(204,71,12));   /* CC470C */
         HPEN   op  = (HPEN)SelectObject(dc, pen);
         HBRUSH ob  = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-        static const int CXS[2] = { S2_MPC_CX, S2_MPC_CX + 100 };
+        static const int CXS[2] = { S2_MPC_CX, S2_MPCDIG_CX };
         for (int d = 0; d < 2; d++) {
             POINT pts[5] = {
                 { CXS[d],              S2_MPC_CY - S2_MPC_R },
@@ -1388,18 +1641,17 @@ static void DrawDyn3(HDC dc) {
             if (occ[r*GCOLS + c])
                 DrawCheck(dc, S3_CX1[c], S3_RY1[r]+4, S3_CX2[c], S3_RY2[r]+4);
 
-    /* 6 bottom button flash — 1px DCE314 rectangle outline each */
-    static const DWORD BITS[6] = {
-        FLASH_S3B1, FLASH_S3B2, FLASH_S3B3,
-        FLASH_S3B4, FLASH_S3B5, FLASH_S3B6
+    /* 4 bottom button flash — 1px DCE314 rectangle outline each */
+    static const DWORD BITS[4] = {
+        FLASH_S3B1, FLASH_S3B2, FLASH_S3B3, FLASH_S3B4
     };
-    for (int b = 0; b < 6; b++) {
+    for (int b = 0; b < 4; b++) {
         if (flashMask & BITS[b]) {
             HPEN   pen = CreatePen(PS_SOLID, 1, RGB(220,227,20));
             HPEN   op  = (HPEN)SelectObject(dc, pen);
             HBRUSH ob  = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-            Rectangle(dc, S3_BTN_X1[b], S3_BTN_Y1,
-                          S3_BTN_X2[b]+1, S3_BTN_Y2+1);
+            Rectangle(dc, S3_BTN_X1[b], S3_BTN_Y1[b],
+                          S3_BTN_X2[b]+1, S3_BTN_Y2[b]+1);
             SelectObject(dc, op);  SelectObject(dc, ob);
             DeleteObject(pen);
         }
@@ -1429,7 +1681,20 @@ static void ClickSect1(int mx, int ry) {
     else if (mx>=65  && mx<=114) { FlashBtn(FLASH_VIEW,  0); SetView((viewState+1)%6); }
     else if (mx>=126 && mx<=227) { FlashBtn(FLASH_HELP,  0); /* Help — placeholder */ }
     else if (mx>=239 && mx<=340) { FlashBtn(FLASH_START, 0); running ? StopAuto() : StartAuto(); }
-    else if (mx>=352 && mx<=453) { FlashBtn(FLASH_SETUP, 0); if (!running) StartCap(1); }
+    else if (mx>=352 && mx<=453) {
+        FlashBtn(FLASH_SETUP, 0);
+        if (!running) {
+            /* Clicking Setup clears grid + row/swap button calibration,
+               forcing fresh capture (targets are left untouched). */
+            gx = gy = gw = gh = 0;       gridSet = FALSE;
+            rb1x = rb1y = 0;             rb1Set  = FALSE;
+            rb2x = rb2y = 0;             rb2Set  = FALSE;
+            rs12x = rs12y = 0;           rs12Set = FALSE;
+            rs34x = rs34y = 0;           rs34Set = FALSE;
+            SaveIni();
+            StartCap(1);
+        }
+    }
     else if (mx>=465 && mx<=566) { FlashBtn(FLASH_EXIT,  0); StopAuto(); DestroyWindow(wMain); }
 }
 
@@ -1471,6 +1736,12 @@ static void ClickSect2(int mx, int ry) {
 }
 
 static void ClickSect3(int mx, int ry) {
+    /* Column-toggle strip along the very top (checked before the grid so
+       the top band toggles columns rather than the row-0 cells). */
+    if (ry >= S3_TOG_Y1 && ry <= S3_TOG_Y2) {
+        for (int c = 0; c < GCOLS; c++)
+            if (mx >= S3_CX1[c] && mx <= S3_CX2[c]) { ColToggle(c); return; }
+    }
     /* Cell grid */
     for (int r = 0; r < GROWS; r++) {
         if (ry < S3_RY1[r] || ry > S3_RY2[r]) continue;
@@ -1485,39 +1756,31 @@ static void ClickSect3(int mx, int ry) {
             InvalidateSect(2);  SaveIni();  return;
         }
     }
-    /* Column toggle strip (no overlay — orange region) */
-    if (ry >= S3_TOG_Y1 && ry <= S3_TOG_Y2) {
-        for (int c = 0; c < GCOLS; c++) {
-            if (mx >= S3_CX1[c] && mx <= S3_CX2[c]) { ColToggle(c); return; }
+    /* 4 bottom action buttons: Save, Load, Toggle Presets, XEROX */
+    for (int b = 0; b < 4; b++) {
+        if (mx < S3_BTN_X1[b] || mx > S3_BTN_X2[b]) continue;
+        if (ry < S3_BTN_Y1[b] || ry > S3_BTN_Y2[b]) continue;
+        FlashBtn(1u << (8+b), 2);
+        switch (b) {
+        case 0:                                     /* Save            */
+            memcpy(customOcc, occ, sizeof occ);
+            cycleState = 0;
+            SaveIni();
+            break;
+        case 1: {                                   /* Load            */
+            char s[NCELLS+2] = "";
+            IniGetStr("_FormationSaved", "", s, sizeof s);
+            int slen = (int)strlen(s);
+            for (int i = 0; i < NCELLS; i++)
+                customOcc[i] = (i < slen && s[i]=='1') ? TRUE : FALSE;
+            ApplyCycle(0);
+            SaveIni();
+            break;
         }
-    }
-    /* 6 bottom action buttons */
-    if (ry >= S3_BTN_Y1 && ry <= S3_BTN_Y2) {
-        for (int b = 0; b < 6; b++) {
-            if (mx < S3_BTN_X1[b] || mx > S3_BTN_X2[b]) continue;
-            FlashBtn(1u << (8+b), 2);
-            switch (b) {
-            case 0: ApplyCycle(1); SaveIni(); break;   /* All On  */
-            case 1: ApplyCycle(2); SaveIni(); break;   /* Left 5  */
-            case 2: ApplyCycle(3); SaveIni(); break;   /* Right 5 */
-            case 3: ApplyCycle(4); SaveIni(); break;   /* All Off */
-            case 4:                                     /* Save    */
-                memcpy(customOcc, occ, sizeof occ);
-                cycleState = 0;
-                SaveIni();
-                break;
-            case 5: {                                   /* Load    */
-                char s[NCELLS+2] = "";
-                IniGetStr("_CustomOcc", "", s, sizeof s);
-                int slen = (int)strlen(s);
-                for (int i = 0; i < NCELLS; i++)
-                    customOcc[i] = (i < slen && s[i]=='1') ? TRUE : FALSE;
-                ApplyCycle(0);
-                break;
-            }
-            }
-            return;
+        case 2: TogglePresets();  break;            /* Toggle Presets  */
+        case 3: StartXerox();     break;            /* XEROX           */
         }
+        return;
     }
 }
 
@@ -1566,7 +1829,7 @@ LRESULT CALLBACK ProcMain(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateSect(0);
             if (prev & (FLASH_MPC|FLASH_DN|FLASH_RST))
                 InvalidateSect(1);
-            if (prev & (FLASH_S3B1|FLASH_S3B2|FLASH_S3B3|FLASH_S3B4|FLASH_S3B5|FLASH_S3B6))
+            if (prev & (FLASH_S3B1|FLASH_S3B2|FLASH_S3B3|FLASH_S3B4))
                 InvalidateSect(2);
         }
         return 0;
@@ -1660,6 +1923,7 @@ LRESULT CALLBACK ProcMain(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_STOPAUTO:   StopAuto();                  return 0;
     case WM_EXITAPP:    StopAuto(); DestroyWindow(w); return 0;
     case WM_STARTDEFER: StartAuto();                 return 0;
+    case WM_XEROXDEFER: StartXerox();                return 0;
 
     case WM_CLOSE:
         StopAuto();  EndCap();  SaveIni();
@@ -1703,8 +1967,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
       }
     }
 
-    /* Populate occ[] from loaded custom/cycle state */
-    ApplyCycle(cycleState);   /* wMain still NULL here; InvalidateSect is a no-op */
+    /* occ[] is loaded directly from _Formation in LoadIni — no rebuild needed. */
 
     /* ── Register main window class ────────────────────────── */
     WNDCLASSEXA wcx;
