@@ -1,2 +1,4 @@
 #include <windows.h>
 1 ICON "AwSim.ico"
+WORKINGBMP BITMAP "working.bmp"
+LETTERSBMP BITMAP "awsimletters.bmp"
