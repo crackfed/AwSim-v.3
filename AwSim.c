@@ -43,6 +43,8 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <time.h>
 
@@ -603,6 +605,23 @@ static void MagZoomKey(int dir) {
     keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);   Sleep(120);
 }
 
+/* If Magnifier is running and zoomed past 100%, drop it to 100% so screen
+   reads use true pixel coords. Returns the number of steps to later restore
+   via MagRestore(). */
+static int MagDropTo100(void) {
+    if (!MagnifierRunning()) return 0;
+    int zoom = MagRegDword("Magnification", 100);
+    int inc  = MagRegDword("ZoomIncrement", 100);
+    if (inc < 1) inc = 100;
+    if (zoom <= 100) return 0;
+    int steps = (zoom - 100 + inc - 1) / inc;          /* ceil */
+    for (int i = 0; i < steps + 3; i++) MagZoomKey(-1); /* +3 clamps at 100 */
+    return steps;
+}
+static void MagRestore(int steps) {
+    for (int i = 0; i < steps; i++) MagZoomKey(+1);
+}
+
 /* XEROX: copy the game's current formation into the boxgrid.
    A unit normally shows NO bolt; a bolt means that unit is disabled.
    XEROX detects every occupied box while leaving any already-disabled
@@ -770,6 +789,253 @@ static BOOL AutoCalibrateGrid(void) {
     return TRUE;
 }
 
+/* ── Cold-start: locate the boxgrid with no saved prior ────────────────────
+   The grid lives in the lowest ~200 px of the screen. We capture that band and
+   find the dark intersection diamonds by dark-density (so they're detected even
+   when the thin gap-lines connect them all into one dark mass). We derive the
+   column/row spacing from the diamonds, identify the lattice, and — only if all
+   8 vertical and all 3 horizontal separators are present — regress the line
+   positions to set the grid edges directly (left/top edge = first separator
+   minus one cell). If it can't lock the full lattice it returns FALSE and the
+   caller falls back to corner marking, so it can never make cold-start worse
+   than the manual path. */
+#define CS_DARK   22     /* per-channel "very dark" threshold        */
+#define CS_BOXR    3     /* half-size of the density box (7x7)        */
+#define CS_DMIN   28     /* min dark pixels in the box to be a "core" */
+
+/* Dominant spacing of values along one axis. Picks the LARGEST period whose
+   alignment count is near the maximum, so a true period of 100 isn't reported
+   as its sub-harmonic 50 (which also aligns). Returns 0 on failure. */
+static int csSpacing(const double *v, int nv, int lo, int hi, int *phaseOut, int *alignedOut) {
+    int gmax = 0;
+    int bestCnt[256]; int bestPh[256];          /* indexed by (S - lo) */
+    if (hi - lo >= 256) hi = lo + 255;
+    for (int S = lo; S <= hi; S++) {
+        int cnt[400];  if (S > 400) break;
+        for (int i = 0; i < S; i++) cnt[i] = 0;
+        for (int i = 0; i < nv; i++) { int m = ((int)(v[i]+0.5)) % S; if (m < 0) m += S; cnt[m]++; }
+        int bc = 0, bp = 0;
+        for (int ph = 0; ph < S; ph++) {
+            int c = 0;
+            for (int d = -2; d <= 2; d++) { int q = (ph+d) % S; if (q < 0) q += S; c += cnt[q]; }
+            if (c > bc) { bc = c; bp = ph; }
+        }
+        bestCnt[S-lo] = bc;  bestPh[S-lo] = bp;
+        if (bc > gmax) gmax = bc;
+    }
+    if (gmax < 3) return 0;
+    for (int S = hi; S >= lo; S--)              /* largest near-max period */
+        if (bestCnt[S-lo] * 100 >= gmax * 85) {
+            *phaseOut = bestPh[S-lo];  *alignedOut = bestCnt[S-lo];  return S;
+        }
+    return 0;
+}
+
+/* Fit a grid axis from a consecutive run of detected lattice lines.
+   The run is either the cell BOUNDARIES (count == ncells+1, i.e. the outer
+   edges were detected too) or the INTERNAL separators (count == ncells-1).
+   We regress line position against boundary index so the intercept is the
+   grid's leading edge. Returns 1 and fills *origin (leading edge) and *cell
+   (cell size); 0 if the run length matches neither layout. */
+static int csFitAxis(const double *sum, const int *cnt, int run0, int runlen,
+                     int ncells, double *origin, double *cell) {
+    int ord0;
+    if (runlen == ncells + 1)      ord0 = 0;   /* boundaries: first line = edge   */
+    else if (runlen == ncells - 1) ord0 = 1;   /* internal: first line = sep #1   */
+    else return 0;
+    double Sm=0, SP=0, Smm=0, SmP=0;
+    for (int t = 0; t < runlen; t++) {
+        double P = sum[run0+t] / cnt[run0+t];
+        int    m = ord0 + t;
+        Sm += m; SP += P; Smm += (double)m*m; SmP += (double)m*P;
+    }
+    double d = runlen*Smm - Sm*Sm;
+    if (d == 0) return 0;
+    *cell   = (runlen*SmP - Sm*SP) / d;
+    *origin = (SP - (*cell)*Sm) / runlen;       /* position at boundary index 0 */
+    return 1;
+}
+
+static BOOL DetectGridColdStart(void) {
+    int SW = GetSystemMetrics(SM_CXSCREEN), SH = GetSystemMetrics(SM_CYSCREEN);
+    int x0 = 0, rw = SW;                        /* full width               */
+    int rh = 200, y0 = SH - rh;                 /* lowest 200 px            */
+    if (y0 < 0) { y0 = 0; rh = SH; }
+    if (rw < 200 || rh < 60) return FALSE;
+
+    HDC scr = GetDC(NULL);
+    HDC mem = CreateCompatibleDC(scr);
+    BITMAPINFO bi;  memset(&bi, 0, sizeof bi);
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = rw;  bi.bmiHeader.biHeight = -rh;   /* top-down */
+    bi.bmiHeader.biPlanes = 1;  bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!dib) { DeleteDC(mem); ReleaseDC(NULL, scr); return FALSE; }
+    HBITMAP ob = (HBITMAP)SelectObject(mem, dib);
+    BitBlt(mem, 0, 0, rw, rh, scr, x0, y0, SRCCOPY);
+    GdiFlush();
+    unsigned char *pix = (unsigned char *)bits;   /* BGRA, row stride rw*4 */
+
+    int n = rw * rh;
+    unsigned char *dark = (unsigned char *)malloc(n);
+    unsigned char *vis  = (unsigned char *)malloc(n);
+    int *stk = (int *)malloc(sizeof(int) * n);
+    int W1 = rw + 1;
+    int *ii  = (int *)malloc(sizeof(int) * W1 * (rh + 1));
+    double *bx = (double *)malloc(sizeof(double) * 2048);
+    double *by = (double *)malloc(sizeof(double) * 2048);
+    if (!dark || !vis || !stk || !ii || !bx || !by) {
+        free(dark); free(vis); free(stk); free(ii); free(bx); free(by);
+        SelectObject(mem, ob); DeleteObject(dib); DeleteDC(mem); ReleaseDC(NULL, scr);
+        return FALSE;
+    }
+    int totalDark = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char *q = pix + (size_t)i*4;
+        dark[i] = (q[0] < CS_DARK && q[1] < CS_DARK && q[2] < CS_DARK);
+        if (dark[i]) totalDark++;
+        vis[i] = 0;
+    }
+    SelectObject(mem, ob); DeleteObject(dib); DeleteDC(mem); ReleaseDC(NULL, scr);
+
+    /* Integral image of the dark map for fast box-density queries. */
+    for (int x = 0; x <= rw; x++) ii[x] = 0;
+    for (int y = 1; y <= rh; y++) {
+        int rs = 0;  ii[y*W1] = 0;
+        for (int x = 1; x <= rw; x++) {
+            rs += dark[(y-1)*rw + (x-1)];
+            ii[y*W1 + x] = ii[(y-1)*W1 + x] + rs;
+        }
+    }
+    /* A diamond is a compact dark patch, so dark density in a small box is high
+       at its centre; a thin gap-line scores low. Marking high-density "cores"
+       finds diamonds even when the gap-lines connect them into one dark mass. */
+    int nCore = 0;
+    for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++) {
+            int x0 = x-CS_BOXR, y0 = y-CS_BOXR, x1 = x+CS_BOXR, y1 = y+CS_BOXR;
+            if (x0 < 0) x0 = 0;
+            if (y0 < 0) y0 = 0;
+            if (x1 >= rw) x1 = rw-1;
+            if (y1 >= rh) y1 = rh-1;
+            int dens = ii[(y1+1)*W1+(x1+1)] - ii[y0*W1+(x1+1)]
+                     - ii[(y1+1)*W1+x0]    + ii[y0*W1+x0];
+            dark[y*rw + x] = (dens >= CS_DMIN);   /* repurpose dark[] as core map */
+            if (dens >= CS_DMIN) nCore++;
+        }
+    free(ii);
+
+    /* Flood-fill the cores into diamond centroids (screen coords). Cores are
+       isolated even when the raw dark pixels were all connected, so each
+       diamond becomes its own small blob. */
+    int nb = 0;
+    for (int s = 0; s < n && nb < 2048; s++) {
+        if (!dark[s] || vis[s]) continue;
+        int sp = 0; stk[sp++] = s; vis[s] = 1;
+        long sx = 0, sy = 0; int cnt = 0, mnx = rw, mxx = 0, mny = rh, mxy = 0;
+        while (sp) {
+            int idx = stk[--sp], x = idx % rw, y = idx / rw;
+            sx += x; sy += y; cnt++;
+            if (x < mnx) mnx = x;
+            if (x > mxx) mxx = x;
+            if (y < mny) mny = y;
+            if (y > mxy) mxy = y;
+            const int ddx[4] = {1,-1,0,0}, ddy[4] = {0,0,1,-1};
+            for (int d = 0; d < 4; d++) {
+                int nx = x+ddx[d], ny = y+ddy[d];
+                if (nx < 0 || nx >= rw || ny < 0 || ny >= rh) continue;
+                int ni = ny*rw + nx;
+                if (dark[ni] && !vis[ni]) { vis[ni] = 1; stk[sp++] = ni; }
+            }
+        }
+        int bw = mxx-mnx+1, bh = mxy-mny+1;
+        if (cnt >= 3 && cnt <= 250 && bw <= 30 && bh <= 30) {
+            bx[nb] = (double)sx/cnt + x0;  by[nb] = (double)sy/cnt + y0;  nb++;
+        }
+    }
+    free(dark); free(vis); free(stk);
+
+    BOOL ok = FALSE;
+    int dCW=0, dCH=0, dCRUN=0, dRRUN=0, dNBcol=0, dNBrow=0;
+    if (nb >= 8) {
+        int phx, alx, phy, aly;
+        int cw = csSpacing(bx, nb, 40, 220, &phx, &alx);    /* cell width  */
+        int ch = csSpacing(by, nb, 22,  90, &phy, &aly);    /* cell height */
+        dCW = cw; dCH = ch;
+        if (cw && ch) {
+            /* Snap each diamond to the column/row lattice (separators ≡ phx/phy
+               mod cw/ch) and accumulate per-line position sums. */
+            #define CS_KMAX 128
+            double colSum[CS_KMAX] = {0}, rowSum[CS_KMAX] = {0};
+            int    colCnt[CS_KMAX] = {0}, rowCnt[CS_KMAX] = {0};
+            int    tolx = cw/5 + 2, toly = ch/5 + 2;
+            for (int i = 0; i < nb; i++) {
+                int k = (int)floor((bx[i]-phx)/(double)cw + 0.5);
+                if (k >= 0 && k < CS_KMAX) {
+                    double d = bx[i]-(phx+(double)k*cw);  if (d < 0) d = -d;
+                    if (d <= tolx) { colSum[k] += bx[i]; colCnt[k]++; }
+                }
+                int j = (int)floor((by[i]-phy)/(double)ch + 0.5);
+                if (j >= 0 && j < CS_KMAX) {
+                    double d = by[i]-(phy+(double)j*ch);  if (d < 0) d = -d;
+                    if (d <= toly) { rowSum[j] += by[i]; rowCnt[j]++; }
+                }
+            }
+            /* Longest run of consecutive populated column / row lines. */
+            int ck0 = 0, crun = 0, rj0 = 0, rrun = 0, cur, st;
+            cur = 0; st = 0;
+            for (int k = 0; k < CS_KMAX; k++) {
+                if (colCnt[k]) { if (!cur) st = k; cur++; if (cur > crun) { crun = cur; ck0 = st; } }
+                else cur = 0;
+            }
+            cur = 0; st = 0;
+            for (int j = 0; j < CS_KMAX; j++) {
+                if (rowCnt[j]) { if (!cur) st = j; cur++; if (cur > rrun) { rrun = cur; rj0 = st; } }
+                else cur = 0;
+            }
+            for (int k = 0; k < CS_KMAX; k++) if (colCnt[k]) dNBcol++;
+            for (int j = 0; j < CS_KMAX; j++) if (rowCnt[j]) dNBrow++;
+            dCRUN = crun; dRRUN = rrun;
+            /* Interpret each run as boundaries (edges detected) or internal
+               separators, independently per axis: the bright side-frame means
+               columns usually show 8 internal lines, while the dark top/bottom
+               gap-notches mean rows can show all 5 boundaries. */
+            double gxF, cwF, gyF, chF;
+            if (csFitAxis(colSum, colCnt, ck0, crun, GCOLS, &gxF, &cwF) &&
+                csFitAxis(rowSum, rowCnt, rj0, rrun, GROWS, &gyF, &chF) &&
+                cwF > 20 && chF > 10) {
+                gx = (int)(gxF+0.5);  gy = (int)(gyF+0.5);
+                gw = (int)(cwF*GCOLS+0.5);  gh = (int)(chF*GROWS+0.5);
+                gridSet = TRUE;
+                ok = TRUE;
+            }
+        }
+    }
+    free(bx); free(by);
+
+    /* Diagnostic: record what cold-start saw, next to the INI. */
+    {
+        char path[MAX_PATH];  strcpy(path, iniPath);
+        char *sl = strrchr(path, '\\');
+        strcpy(sl ? sl+1 : path, "_ColdStart.txt");
+        char d[512];
+        int dl = snprintf(d, sizeof d,
+            "region x0=%d y0=%d rw=%d rh=%d (screen %dx%d)\r\n"
+            "darkPixels=%d  cores=%d  diamonds=%d\r\n"
+            "cellW=%d cellH=%d  colLines=%d rowLines=%d  colRun=%d rowRun=%d\r\n"
+            "need colRun>=%d rowRun>=%d  ->  %s\r\n",
+            x0, y0, rw, rh, SW, SH, totalDark, nCore, nb,
+            dCW, dCH, dNBcol, dNBrow, dCRUN, dRRUN,
+            GCOLS-1, GROWS-1, ok ? "LOCKED" : "fell back to user setup");
+        HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(hf, d, (DWORD)dl, &wr, NULL); CloseHandle(hf); }
+    }
+    return ok;
+}
+
 /* "WORKING" image blitted over the XEROX button while a capture runs.
    XeroxFormation blocks the main thread (Sleeps), so no WM_PAINT fires —
    we blit straight to the window DC, then InvalidateSect(3) at the end
@@ -807,18 +1073,8 @@ static void XeroxFormation(void) {
 
     /* If Magnifier is running and zoomed past 100%, drop it to 100% so the
        screen capture is at true 1:1 scale; remember how far to restore. */
-    BOOL mag = MagnifierRunning();
-    int  magSteps = 0;
-    if (mag) {
-        int zoom = MagRegDword("Magnification", 100);
-        int inc  = MagRegDword("ZoomIncrement", 100);
-        if (inc  < 5)   inc  = 100;
-        if (zoom > 100) {
-            magSteps = (zoom - 100 + inc - 1) / inc;             /* ceil */
-            for (int i = 0; i < magSteps + 3; i++) MagZoomKey(-1); /* clamp@100 */
-            Sleep(200);
-        }
-    }
+    int magSteps = MagDropTo100();
+    if (magSteps) Sleep(200);
 
     /* Now at 100% zoom and about to scan — re-calibrate the grid from its
        dark intersection diamonds so XEROX stays aligned if it has shifted.
@@ -869,7 +1125,7 @@ static void XeroxFormation(void) {
 
     /* Restore Magnifier zoom last, after all operations. Everything above
        ran at 100%; the clicks use true screen coords so zoom didn't matter. */
-    for (int i = 0; i < magSteps; i++) MagZoomKey(+1);
+    MagRestore(magSteps);
 
     /* Redraw the boxgrid overlay and tidy up; cursor returns to XEROX. */
     SetCursorPos(savePos.x, savePos.y);
@@ -2366,15 +2622,25 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
         SetWindowPos(wMain, NULL, winSX, winSY, 0, 0,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
 
-    /* Boxgrid calibration chain:
+    /* Boxgrid calibration chain (run at 100% zoom — the saved grid is stored
+       at 100%, so detection must happen there too):
        - saved grid present  -> auto-calibrate from the 24 dark intersection
          diamonds; if they aren't found, AutoCalibrateGrid leaves the saved
          values untouched (revert to saved).
-       - no saved grid        -> ask the user to mark the corners. */
-    if (gridSet) {
-        if (AutoCalibrateGrid()) SaveIni();
-    } else {
-        StartCap(1);
+       - no saved grid        -> auto-detect from the diamond lattice, else
+         ask the user to mark the corners. */
+    {
+        int calMag = MagDropTo100();
+        if (calMag) Sleep(200);
+        if (gridSet) {
+            if (AutoCalibrateGrid()) SaveIni();
+            MagRestore(calMag);
+        } else {
+            BOOL got = DetectGridColdStart();
+            MagRestore(calMag);              /* restore before any user marking */
+            if (got) SaveIni();
+            else StartCap(1);
+        }
     }
 
     MSG mmsg;
