@@ -1,7 +1,7 @@
 /*
- * AwSim.c  –  v3.0
+ * AwSim.c  –  v3.1
  * ═══════════════════════════════════════════════════════════════════
- * Compile:
+static int sectionY[4] = { 0, SH0, SH0 + SH1, SH0 + SH1 + SH2 };
  *   windres AwSim.rc -O coff -o AwSim.res
  *   gcc -O2 -o AwSim.exe AwSim.c AwSim.res -luser32 -lgdi32 -mwindows
  *
@@ -24,10 +24,10 @@
  *   [0]     = '.' or '#'   dot-mode vs number-mode
  *   [1..2]  = CR engines (mutually exclusive):
  *               [1]=AwSim  [2]=Decoy        0=off, else=run-order rank
- *   [3..7]  = FS engines (ranked by selection order):
- *               [3]=Permute Rows [4]=Scout DZ [5]=Col.Ops
- *               [6]=Row Ops   [7]=Quick Opt  0=off, 1-6=run-order rank
- *   [8..10] = Overdrive flags: [8]=Scout DZ [9]=Col.Ops [10]=Row Ops
+ *   [3..6]  = FS engines (ranked by selection order):
+ *               [3]=Col.Ops [4]=Row Ops [5]=Permute [6]=Scout
+ *   [7..10] = Advanced flags: [7]=Permute [8]=Col.Ops
+ *               [9]=Row Ops [10]=Scout
  *   [11]    = MPC '1'..'5'
  *   Default: ".10000000003"
  *
@@ -40,16 +40,21 @@
  *   ×3 clicks →  recapture screen coordinate via crosshair overlay
  */
 
+#define COBJMACROS
 #include <windows.h>
+#include <shlobj.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <limits.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
 
 #define APP_NAME   "AwSim"
-#define APP_VER    "3.0"
+#define APP_VER    "3.1"
+#define APP_SCHEMA 1
 #define WIN_W      580
 #define EDGE_X       3       /* cursor x ≤ this  →  exit             */
 #define INI_UNSET  -32768
@@ -67,6 +72,9 @@
 #define GROWS   4
 #define NCELLS  36   /* GCOLS × GROWS                               */
 #define NTGTS    5
+#define BOX_RESERVE  0
+#define BOX_ACTIVE   1
+#define BOX_DISABLED 2
 
 /* ── Window / class names ─────────────────────────────────────── */
 #define CLS_MAIN  "AwSimMain"
@@ -78,21 +86,16 @@
 #define WM_EXITAPP     (WM_APP + 2)
 #define WM_STARTDEFER  (WM_APP + 3)
 #define WM_XEROXDEFER  (WM_APP + 4)
+#define WM_TASKBARPROMPT (WM_APP + 5)
 
 /* ── Button flash IDs (bit positions in flashMask) ──────────── */
-#define FLASH_VIEW   (1u<<0)   /* Sec1 <View>  (both < and >)     */
-#define FLASH_HELP   (1u<<1)   /* Sec1 Help                        */
-#define FLASH_START  (1u<<2)   /* Sec1 Start / Stop                */
-#define FLASH_SETUP  (1u<<3)   /* Sec1 Setup                       */
-#define FLASH_EXIT   (1u<<4)   /* Sec1 Exit                        */
 #define FLASH_MPC    (1u<<5)   /* Sec2 MPC + button                */
 #define FLASH_DN     (1u<<6)   /* Sec2 #/. toggle                  */
 #define FLASH_RST    (1u<<7)   /* Sec2 Reset button                */
-#define FLASH_S3B1   (1u<<8)   /* Sec3 Save           button      */
-#define FLASH_S3B2   (1u<<9)   /* Sec3 Load           button      */
-#define FLASH_S3B3   (1u<<10)  /* Sec3 Toggle Presets button      */
-#define FLASH_S3B4   (1u<<11)  /* Sec3 XEROX          button      */
+#define FLASH_S3B3   (1u<<8)   /* Sec3 Toggle Presets button      */
+#define FLASH_S3B4   (1u<<9)   /* Sec3 XEROX          button      */
 #define IDT_FLASH    1         /* WM_TIMER ID for flash clear      */
+#define IDT_STOP_POLL 2        /* poll worker completion while stopping */
 
 /* ═══════════════════════════════════════════════════════════════
    HOTSPOT COORDINATES  — measured from click-overlay images.
@@ -106,45 +109,45 @@
 
 /* Section 2 – Engines ─────────────────────────────────────── */
 /* CR: 2 buttons at fixed y-centres, shared x column          */
-#define S2_CR_CX     27   /* indicator draw x                  */
-#define S2_CR1_Y     58   /* AwSim centre y                    */
-#define S2_CR2_Y    117   /* Decoy  centre y                   */
+#define S2_CR_CX     30   /* indicator draw x                  */
+#define S2_CR1_Y     41   /* AwSim centre y                    */
+#define S2_CR2_Y    109   /* Decoy  centre y                   */
 #define S2_CR_XA      8   /* click x left  bound               */
 #define S2_CR_XB    177   /* click x right bound               */
-/* FS: 5 buttons at shared x, row centres                     */
-#define S2_FS_CX    243   /* indicator draw x (was 234, +9)    */
-static const int S2_CY[5] = { 17, 43, 69, 95, 121 };
-#define S2_FS_XA    185   /* click x left  bound               */
-#define S2_FS_XB    439   /* click x right bound (OD starts 440) */
-/* Overdrive diamonds: 3, for FS2/FS3/FS4 (rows 1,2,3)       */
-#define S2_OD_CX    466   /* indicator draw x (was 459, +7)    */
-#define S2_OD_XA    440   /* click x left  bound               */
-#define S2_OD_XB    478   /* click x right bound               */
-#define S2_ROW_YTOL  12   /* ±px tolerance from row centre     */
+/* FS: 4 buttons at shared x, row centres                     */
+#define S2_FS_CX    235   /* indicator draw x (was 234, +9)   was 243  */
+static const int S2_CY[4] = { 38, 64, 90, 116 };
+#define S2_FS_XA    202   /* left half of each engine row       */
+#define S2_FS_XB    352
+/* Advanced buttons: right half of each engine row              */
+#define S2_OD_CX    455   /* indicator draw x (was 459, +7)  was 466   */
+#define S2_OD_XA    353   /* click x left bound               */
+#define S2_OD_XB    503   /* click x right bound              */
+#define S2_ROW_YTOL  12   /* ±px tolerance from row centre   was  12   */
 /* number/dot toggle button (far-right top box)              */
-#define S2_DN_X1    522
-#define S2_DN_X2    560
-#define S2_DN_Y1     17
-#define S2_DN_Y2     55
+#define S2_DN_X1    519
+#define S2_DN_X2    557
+#define S2_DN_Y1     29
+#define S2_DN_Y2     67
 /* Reset button (far-right bottom box)                         */
-#define S2_RST_X1   522
-#define S2_RST_X2   560
-#define S2_RST_Y1    81
-#define S2_RST_Y2   119
+#define S2_RST_X1   519    /* was 522 */
+#define S2_RST_X2   557    /* was 560 */
+#define S2_RST_Y1    84    /* was  81 */
+#define S2_RST_Y2   122    /* was 119 */
 /* MPC+ button — diamond flash, half-diag = S2_MPC_R.
    The + button and the digit display swapped sides: the + button (and its
    click hotspot) is now on the right; the digit display is on the left.  */
-#define S2_MPC_CX   153   /* + button centre  (x+1)            */
-#define S2_MPCDIG_CX 112  /* digit-display diamond centre (x+79) */
-#define S2_MPC_CY    88   /* both diamonds (y+1)               */
-#define S2_MPC_R     15
+#define S2_MPC_CX    160   /* + button centre  (x+1)       _OK_  was 153   */
+#define S2_MPCDIG_CX 53 /* digit-display diamond centre (x+79) x pos of diamond _OK_ was 112  */
+#define S2_MPC_CY    76   /* both diamonds (y+1)         y pos of diamonds _OK_    was 88  */
+#define S2_MPC_R     17   /*  size of diamond flash _OK_ was 15  */
 #define S2_MPC_X1   (S2_MPC_CX - S2_MPC_R)
 #define S2_MPC_X2   (S2_MPC_CX + S2_MPC_R)
 #define S2_MPC_Y1   (S2_MPC_CY - S2_MPC_R)
 #define S2_MPC_Y2   (S2_MPC_CY + S2_MPC_R)
 /* MPC digit display position (DrawDSeg 5x7 at this origin)   */
-#define S2_DIGX     140
-#define S2_DIGY      81
+#define S2_DIGX     140    /*  was 140  */
+#define S2_DIGY      81    /*  was 81  */
 
 /* Section 3 – Boxgrid ─────────────────────────────────────── */
 /* Cell grid — column x bounds unchanged, row y bounds (centres at y=14,37,60,83) */
@@ -156,13 +159,12 @@ static const int S3_RY2[4] = {  25,  48,  71,  94 };
 /* Column-toggle strip: thin band along the very top, above the boxgrid.
    Click above column c to toggle that whole column.                */
 #define S3_TOG_Y1    0
-#define S3_TOG_Y2    4
-/* 4 action buttons below the boxgrid: Save, Load, Toggle Presets, XEROX.
-   XEROX sits apart on the right and is slightly taller.            */
-static const int S3_BTN_X1[4] = {  55, 179, 303, 425 };
-static const int S3_BTN_X2[4] = { 140, 264, 388, 525 };
-static const int S3_BTN_Y1[4] = { 110, 110, 110, 106 };
-static const int S3_BTN_Y2[4] = { 130, 130, 130, 134 };
+#define S3_TOG_Y2    6
+/* Remaining action buttons below the boxgrid: Toggle Presets and XEROX. */
+static const int S3_BTN_X1[2] = {  47, 462 };
+static const int S3_BTN_X2[2] = { 135, 550 };
+static const int S3_BTN_Y1[2] = { 109, 106 };
+static const int S3_BTN_Y2[2] = { 133, 134 };
 
 /* Section 4 – Targets ─────────────────────────────────────── */
 static const int S4_X1[5] = {   8, 122, 236, 350, 464 };
@@ -177,14 +179,11 @@ static HINSTANCE hI;
 static HBITMAP   hWork = NULL;        /* "WORKING" overlay bitmap (from resource) */
 static HBITMAP   hLetters = NULL;     /* red AWSIM letters overlay (from resource) */
 static HWND      wMain = NULL;
+static HWND      gameWindow = NULL;
 static HWND      wCap  = NULL;
 static HWND      wHelp = NULL;   /* Help topics window (Option 1)        */
-static int       helpSel = 0;    /* selected Help topic index            */
 static HBITMAP   hBmp[4];
-
-/* View ──────────────────────────────────────────────────────── */
-static int viewState = 0;
-static int sectionY[4] = { 0, SH0, SH0+SH1, SH0+SH1+SH2 };
+static BOOL      debugMode = FALSE;
 
 static const int  SECT_H[4]        = { SH0, SH1, SH2, SH3 };
 static const BOOL VIEW_VIS[6][4]   = {
@@ -192,67 +191,112 @@ static const BOOL VIEW_VIS[6][4]   = {
     {1,0,1,0}, {1,0,0,1}, {1,0,0,0}
 };
 
-/* Engine ─────────────────────────────────────────────────────── */
-static char engVars[13] = ".10000000003";
+typedef struct {
+    int viewState;
+    int sectionY[4];
+    char engVars[13];
+    BYTE boxState[NCELLS];
+    int tgtX[NTGTS], tgtY[NTGTS];
+    BOOL tgtSet[NTGTS];
+    int activeTgt;
+    DWORD tgtLastTick[NTGTS];
+    int tgtClickCnt[NTGTS];
+    int rb1x, rb1y, rb2x, rb2y;
+    BOOL rb1Set, rb2Set;
+    int rs12x, rs12y, rs34x, rs34y;
+    BOOL rs12Set, rs34Set;
+    int gx, gy, gw, gh;
+    BOOL gridSet, running, exitPending;
+    DWORD flashMask;
+    int capMode, capStep;
+    POINT capP1;
+    BOOL pendingStart, pendingXerox;
+    BOOL taskbarPromptPending;
+    char iniPath[MAX_PATH];
+    int winSX, winSY;
+    int presetIdx;
+    int helpSel;
+} AppState;
 
-/* Boxgrid ───────────────────────────────────────────────────── */
-static BOOL occ[NCELLS];
-static BOOL customOcc[NCELLS];
-static int  cycleState = 0;
+static AppState app = {
+    .sectionY = { 0, SH0, SH0 + SH1, SH0 + SH1 + SH2 },
+    .engVars = ".10000000003",
+    .winSX = INI_UNSET,
+    .winSY = INI_UNSET,
+    .presetIdx = -1
+};
+
+#define viewState app.viewState
+#define sectionY app.sectionY
+#define engVars app.engVars
+#define boxState app.boxState
+#define tgtX app.tgtX
+#define tgtY app.tgtY
+#define tgtSet app.tgtSet
+#define activeTgt app.activeTgt
+#define tgtLastTick app.tgtLastTick
+#define tgtClickCnt app.tgtClickCnt
+#define rb1x app.rb1x
+#define rb1y app.rb1y
+#define rb2x app.rb2x
+#define rb2y app.rb2y
+#define rb1Set app.rb1Set
+#define rb2Set app.rb2Set
+#define rs12x app.rs12x
+#define rs12y app.rs12y
+#define rs34x app.rs34x
+#define rs34y app.rs34y
+#define rs12Set app.rs12Set
+#define rs34Set app.rs34Set
+#define gx app.gx
+#define gy app.gy
+#define gw app.gw
+#define gh app.gh
+#define gridSet app.gridSet
+#define running app.running
+#define flashMask app.flashMask
+#define capMode app.capMode
+#define capStep app.capStep
+#define capP1 app.capP1
+#define pendingStart app.pendingStart
+#define pendingXerox app.pendingXerox
+#define iniPath app.iniPath
+#define winSX app.winSX
+#define winSY app.winSY
+#define presetIdx app.presetIdx
+#define helpSel app.helpSel
 
 /* Targets ───────────────────────────────────────────────────── */
 static const char *tgtLabels[NTGTS] = { "CY","DF","Deff","CC","CY*" };
-static int  tgtX[NTGTS], tgtY[NTGTS];
-static BOOL tgtSet[NTGTS];
-static int  activeTgt = 0;
-static DWORD tgtLastTick[NTGTS];
-static int   tgtClickCnt[NTGTS];
 
 /* Row button calibration (Engine 6 — Row Ops) ──────────────── */
-static int  rb1x, rb1y;          /* MR1 centre — top-left  button */
-static int  rb2x, rb2y;          /* SR4 centre — bot-right button */
-static BOOL rb1Set = FALSE, rb2Set = FALSE;
 /* Permute Rows (swap) calibration (Engine 3 = FS1) ──────────── */
-static int  rs12x, rs12y;        /* Swap rows 1-2 button centre   */
-static int  rs34x, rs34y;        /* Swap rows 3-4 button centre   */
-static BOOL rs12Set = FALSE, rs34Set = FALSE;
 
 /* Game screen grid ──────────────────────────────────────────── */
-static int  gx, gy, gw, gh;
-static BOOL gridSet = FALSE;
 
 /* Automation ────────────────────────────────────────────────── */
-static BOOL   running  = FALSE;
 static HANDLE hThread  = NULL;
 static HANDLE hStop    = NULL;
 static HHOOK  hHook    = NULL;
+static BOOL edgeExitArmed = FALSE;
 
 /* Flash ─────────────────────────────────────────────────────── */
-static DWORD flashMask = 0;
 
 /* Capture ───────────────────────────────────────────────────── */
-static int   capMode     = 0;   /* 1=grid  2..6=target 0..4    */
-static int   capStep     = 0;
-static POINT capP1;
-static BOOL  pendingStart = FALSE;
-static BOOL  pendingXerox = FALSE;
 
 /* INI ───────────────────────────────────────────────────────── */
-static char iniPath[MAX_PATH];
-static int  winSX = INI_UNSET, winSY = INI_UNSET;
 
 /* ═══════════════════════════════════════════════════════════════
    FORWARD DECLARATIONS
 ═══════════════════════════════════════════════════════════════ */
 static void SetView(int v);
-static void ApplyCycle(int state);
 static void EngineClick(int btn);
 static void InvalidateSect(int n);
 static void SaveIni(void);
 static void LoadIni(void);
 static void StartAuto(void);
 static void StartXerox(void);
-static void StopAuto(void);
+static BOOL StopAuto(void);
 static void StartCap(int mode);
 static void EndCap(void);
 static void FlashBtn(DWORD bits, int sect);
@@ -260,7 +304,9 @@ static void Center(int idx, int *ox, int *oy);
 static void DoClick(int x, int y);
 static void DoDbl(int x, int y);
 static void SendKey(WORD vk);
-static void FocusGameTab(void);
+static BOOL FocusGameTab(void);
+static BOOL IsTaskbarPinned(void);
+static void PromptTaskbarPin(void);
 LRESULT CALLBACK ProcMain(HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK ProcCap (HWND, UINT, WPARAM, LPARAM);
 LRESULT CALLBACK ProcHelp(HWND, UINT, WPARAM, LPARAM);
@@ -272,11 +318,161 @@ DWORD   WINAPI   AutoRun (LPVOID);
 /* ═══════════════════════════════════════════════════════════════
    INI HELPERS
 ═══════════════════════════════════════════════════════════════ */
+static void LogApp(const char *message);
+static void IniSetInt(const char *k, int v);
+static int IniGetInt(const char *k, int def);
+
 static void MakeIniPath(void) {
-    GetModuleFileNameA(NULL, iniPath, sizeof iniPath);
-    char *sl = strrchr(iniPath, '\\');
-    if (sl) *(sl+1) = '\0'; else iniPath[0] = '\0';
-    strcat(iniPath, "_AwSim.ini");
+    char modulePath[MAX_PATH];
+    DWORD length = GetModuleFileNameA(NULL, modulePath, sizeof modulePath);
+    if (!length || length >= sizeof modulePath) { iniPath[0] = '\0'; return; }
+    char *sl = strrchr(modulePath, '\\');
+    if (sl) *(sl + 1) = '\0'; else modulePath[0] = '\0';
+    if (snprintf(iniPath, sizeof iniPath, "%s_AwSim.ini", modulePath) >= (int)sizeof iniPath)
+        iniPath[0] = '\0';
+}
+
+static BOOL SameFullPath(const char *left, const char *right) {
+    char fullLeft[MAX_PATH], fullRight[MAX_PATH];
+    DWORD lenLeft = GetFullPathNameA(left, MAX_PATH, fullLeft, NULL);
+    DWORD lenRight = GetFullPathNameA(right, MAX_PATH, fullRight, NULL);
+    if (!lenLeft || lenLeft >= MAX_PATH || !lenRight || lenRight >= MAX_PATH)
+        return _stricmp(left, right) == 0;
+    return _stricmp(fullLeft, fullRight) == 0;
+}
+
+static BOOL HasDebugArgument(void) {
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return FALSE;
+    BOOL found = FALSE;
+    for (int i = 1; i < argc; i++) {
+        if (_wcsicmp(argv[i], L"-debug") == 0) { found = TRUE; break; }
+    }
+    LocalFree(argv);
+    return found;
+}
+
+static BOOL IsTaskbarPinned(void) {
+    char appData[MAX_PATH], folder[MAX_PATH], pattern[MAX_PATH], exePath[MAX_PATH];
+    if (FAILED(SHGetFolderPathA(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, appData)))
+        return FALSE;
+    if (snprintf(folder, sizeof folder,
+                 "%s\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar",
+                 appData) >= (int)sizeof folder ||
+        snprintf(pattern, sizeof pattern, "%s\\*.lnk", folder) >= (int)sizeof pattern)
+        return FALSE;
+    DWORD exeLen = GetModuleFileNameA(NULL, exePath, sizeof exePath);
+    if (!exeLen || exeLen >= sizeof exePath) return FALSE;
+
+    HRESULT initResult = CoInitialize(NULL);
+    if (FAILED(initResult) && initResult != RPC_E_CHANGED_MODE) return FALSE;
+    BOOL uninitialize = SUCCEEDED(initResult);
+    BOOL found = FALSE;
+    WIN32_FIND_DATAA data;
+    HANDLE search = FindFirstFileA(pattern, &data);
+    if (search != INVALID_HANDLE_VALUE) {
+        do {
+            char shortcut[MAX_PATH];
+            if (snprintf(shortcut, sizeof shortcut, "%s\\%s", folder, data.cFileName)
+                >= (int)sizeof shortcut) continue;
+            WCHAR wideShortcut[MAX_PATH];
+            if (!MultiByteToWideChar(CP_ACP, 0, shortcut, -1,
+                                     wideShortcut, MAX_PATH)) continue;
+
+            IShellLinkA *link = NULL;
+            HRESULT hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER,
+                                          &IID_IShellLinkA, (void **)&link);
+            if (FAILED(hr) || !link) continue;
+            IPersistFile *persist = NULL;
+            hr = IShellLinkA_QueryInterface(link, &IID_IPersistFile, (void **)&persist);
+            if (SUCCEEDED(hr) && persist) {
+                if (SUCCEEDED(IPersistFile_Load(persist, wideShortcut, STGM_READ))) {
+                    char target[MAX_PATH];
+                    if (SUCCEEDED(IShellLinkA_GetPath(link, target, MAX_PATH, NULL,
+                                                      SLGP_RAWPATH)) &&
+                        SameFullPath(target, exePath))
+                        found = TRUE;
+                }
+                IPersistFile_Release(persist);
+            }
+            IShellLinkA_Release(link);
+            if (found) break;
+        } while (FindNextFileA(search, &data));
+        FindClose(search);
+    }
+    if (uninitialize) CoUninitialize();
+    return found;
+}
+
+static void PromptTaskbarPin(void) {
+    if (IsTaskbarPinned()) return;
+    int answer = MessageBoxA(wMain,
+        "Would you like quick access by placing AwSim on your taskbar?",
+        APP_NAME, MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND);
+    if (answer != IDYES) return;
+    LogApp("User accepted taskbar access prompt; Windows requires manual pin confirmation.");
+    MessageBoxA(wMain,
+        "Windows requires you to confirm taskbar pins yourself. Right-click the AwSim icon on the taskbar and choose 'Pin to taskbar'.",
+        APP_NAME, MB_OK | MB_ICONINFORMATION | MB_TOPMOST | MB_SETFOREGROUND);
+}
+
+static void LogApp(const char *message) {
+    if (!debugMode) return;
+    char path[MAX_PATH];
+    if (snprintf(path, sizeof path, "%s.log", iniPath) >= (int)sizeof path) return;
+    HANDLE file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    char line[512];
+    int len = snprintf(line, sizeof line, "%04u-%02u-%02u %02u:%02u:%02u %s\r\n",
+                       now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute,
+                       now.wSecond, message);
+    DWORD written;
+    if (len > 0 && len < (int)sizeof line)
+        WriteFile(file, line, (DWORD)len, &written, NULL);
+    CloseHandle(file);
+}
+
+static BOOL PointOnVirtualDesktop(int x, int y) {
+    int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int right = left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int bottom = top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    return x >= left && x < right && y >= top && y < bottom;
+}
+
+static void NormalizeEngineSettings(char *eng) {
+    int rank[4], seen[5] = {0};
+    for (int i = 0; i < 10; i++)
+        if (eng[i] < '0' || eng[i] > '9') eng[i] = '0';
+
+    for (int i = 0; i < 4; i++) {
+        rank[i] = eng[i + 2] - '0';
+        if (rank[i] < 1 || rank[i] > 4 || seen[rank[i]]) rank[i] = 0;
+        else seen[rank[i]] = 1;
+        eng[i + 2] = '0';
+        if (eng[i + 6] != '1') eng[i + 6] = '0';
+    }
+    int nextRank = 0;
+    for (int order = 1; order <= 4; order++)
+        for (int i = 0; i < 4; i++)
+            if (rank[i] == order) eng[i + 2] = (char)('0' + ++nextRank);
+
+    for (int i = 0; i < 2; i++)
+        if (eng[i] > '5') eng[i] = '0';
+    if (eng[0] != '0' && eng[1] != '0') {
+        if (eng[1] < eng[0]) eng[0] = '0';
+        else eng[1] = '0';
+    }
+    if (eng[0] != '0') eng[0] = (char)('0' + nextRank + 1);
+    if (eng[1] != '0') eng[1] = (char)('0' + nextRank + 1);
+    for (int i = 6; i < 10; i++)
+        if (eng[i] != '1') eng[i] = '0';
+    for (int i = 0; i < 4; i++)
+        if (eng[i + 6] == '1' && eng[i + 2] == '0') eng[i + 6] = '0';
 }
 
 static void IniSetInt(const char *k, int v) {
@@ -299,12 +495,13 @@ static void SaveIni(void) {
 
     IniSetStr("_Author",       "crackfed");
     IniSetStr("_AwSimVersion", APP_VER);
+    IniSetInt("_SchemaVersion", APP_SCHEMA);
     IniSetInt("_Window-X",     wr.left);
     IniSetInt("_Window-Y",     wr.top);
     IniSetInt("_View",         viewState);
 
-    /* engVars is split across three keys:
-       [0]=selection style, [1..10]=engine ranks, [11]=moves-per-cycle */
+     /* engVars is split across three keys:
+         [0]=selection style, [1..10]=engine settings, [11]=moves-per-cycle */
     char sel[2] = { engVars[0], '\0' };
     IniSetStr("_SelectionStyle", sel);
     char eng[11];
@@ -313,13 +510,11 @@ static void SaveIni(void) {
     char mpc[2] = { engVars[11], '\0' };
     IniSetStr("_MovesPerCycle", mpc);
 
-    /* Current grid (Formation) and the SAVE-button snapshot (FormationSaved) */
+    /* Current grid formation */
     char f[NCELLS + 1];
-    for (int i = 0; i < NCELLS; i++) f[i] = occ[i] ? '1' : '0';
+    for (int i = 0; i < NCELLS; i++) f[i] = (char)('0' + boxState[i]);
     f[NCELLS] = '\0';
     IniSetStr("_Formation", f);
-    for (int i = 0; i < NCELLS; i++) f[i] = customOcc[i] ? '1' : '0';
-    IniSetStr("_FormationSaved", f);
 
     /* Active target stored as its label (CY/DF/Deff/CC/CY*) */
     IniSetStr("_Target", tgtLabels[activeTgt]);
@@ -350,6 +545,11 @@ static void SaveIni(void) {
 }
 
 static void LoadIni(void) {
+    int schema = IniGetInt("_SchemaVersion", 0);
+    if (schema > APP_SCHEMA)
+        LogApp("Settings were written by a newer schema; unsupported values may be ignored.");
+    else if (schema < 0)
+        LogApp("Invalid settings schema version; validating known settings.");
     winSX     = IniGetInt("_Window-X", INI_UNSET);
     winSY     = IniGetInt("_Window-Y", INI_UNSET);
     viewState = IniGetInt("_View", 0);
@@ -362,21 +562,43 @@ static void LoadIni(void) {
     IniGetStr("_MovesPerCycle",  "3",          mpc, sizeof mpc);
     if (sel[0] != '.' && sel[0] != '#') sel[0] = '.';
     if (strlen(eng) < 10)               strcpy(eng, "1000000000");
+    {
+        char savedVersion[16];
+        IniGetStr("_AwSimVersion", "3.0", savedVersion, sizeof savedVersion);
+        if (strcmp(savedVersion, "3.0") == 0) {
+            char old[11];
+            memcpy(old, eng, 10);  old[10] = '\0';
+            eng[2] = old[4];  /* Column Ops rank */
+            eng[3] = old[5];  /* Row Ops rank */
+            eng[4] = old[2];  /* Permute rank */
+            eng[5] = old[3];  /* Scout rank */
+            eng[6] = '0';     /* no legacy Permute Advanced flag */
+            eng[7] = (old[8] != '0') ? '1' : '0'; /* Column Advanced */
+            eng[8] = (old[9] != '0') ? '1' : '0'; /* Row Advanced */
+            eng[9] = (old[7] != '0') ? '1' : '0'; /* Scout Advanced */
+            if (old[6] != '0') {
+                for (int i = 0; i < 6; i++)
+                    if (eng[i] > old[6]) eng[i]--;
+            }
+        }
+    }
+    NormalizeEngineSettings(eng);
     if (mpc[0] < '1' || mpc[0] > '5')   mpc[0] = '3';
     engVars[0] = sel[0];
     memcpy(engVars + 1, eng, 10);
     engVars[11] = mpc[0];
     engVars[12] = '\0';
 
-    /* Current grid (Formation) loaded directly; SAVE snapshot separately */
+    /* Restore the current grid formation */
     char f[NCELLS + 2] = "";
     IniGetStr("_Formation", "", f, sizeof f);
     int fl = (int)strlen(f);
-    for (int i = 0; i < NCELLS; i++) occ[i] = (i < fl && f[i] == '1');
-    IniGetStr("_FormationSaved", "", f, sizeof f);
-    fl = (int)strlen(f);
-    for (int i = 0; i < NCELLS; i++) customOcc[i] = (i < fl && f[i] == '1');
-    cycleState = 0;   /* grid loaded directly; start in custom (non-preset) mode */
+    for (int i = 0; i < NCELLS; i++) {
+        int state = fl == 0 ? BOX_ACTIVE
+                            : (i < fl ? f[i] - '0' : BOX_RESERVE);
+        boxState[i] = (BYTE)(state >= BOX_RESERVE && state <= BOX_DISABLED
+                             ? state : BOX_RESERVE);
+    }
 
     /* Active target — match the saved label back to its index */
     char tg[16];
@@ -393,21 +615,35 @@ static void LoadIni(void) {
     for (int i = 0; i < NTGTS; i++) {
         sprintf(key, "%s-X", TGTKEY[i]); tgtX[i] = IniGetInt(key, 0);
         sprintf(key, "%s-Y", TGTKEY[i]); tgtY[i] = IniGetInt(key, 0);
+        if ((tgtX[i] != 0 || tgtY[i] != 0) &&
+            !PointOnVirtualDesktop(tgtX[i], tgtY[i])) {
+            char warning[96];
+            snprintf(warning, sizeof warning, "Target %s calibration is off-screen; cleared.",
+                     tgtLabels[i]);
+            LogApp(warning);
+            tgtX[i] = tgtY[i] = 0;
+        }
         tgtSet[i] = (tgtX[i] != 0 || tgtY[i] != 0);
     }
 
     /* Boxgrid + button calibration; Set flags derived from nonzero coords */
     gx = IniGetInt("_BoxGrid-X", 0);     gy = IniGetInt("_BoxGrid-Y", 0);
     gw = IniGetInt("_BoxGridWidth", 0);  gh = IniGetInt("_BoxGridHeight", 0);
-    gridSet = (gx != 0 || gy != 0);
+    gridSet = (gw >= 90 && gh >= 40 &&
+               (long long)gx + gw - 1 <= INT_MAX &&
+               (long long)gy + gh - 1 <= INT_MAX &&
+               PointOnVirtualDesktop(gx, gy) &&
+               PointOnVirtualDesktop(gx + gw - 1, gy + gh - 1));
+    if ((gx != 0 || gy != 0 || gw != 0 || gh != 0) && !gridSet)
+        LogApp("Saved boxgrid calibration is invalid or off-screen; setup required.");
     rb1x = IniGetInt("_BtnRow1Mirror-X", 0);  rb1y = IniGetInt("_BtnRow1Mirror-Y", 0);
-    rb1Set = (rb1x != 0 || rb1y != 0);
+    rb1Set = (rb1x != 0 || rb1y != 0) && PointOnVirtualDesktop(rb1x, rb1y);
     rb2x = IniGetInt("_BtnRow4RShift-X", 0);  rb2y = IniGetInt("_BtnRow4RShift-Y", 0);
-    rb2Set = (rb2x != 0 || rb2y != 0);
+    rb2Set = (rb2x != 0 || rb2y != 0) && PointOnVirtualDesktop(rb2x, rb2y);
     rs12x = IniGetInt("_BtnSwapRows12-X", 0); rs12y = IniGetInt("_BtnSwapRows12-Y", 0);
-    rs12Set = (rs12x != 0 || rs12y != 0);
+    rs12Set = (rs12x != 0 || rs12y != 0) && PointOnVirtualDesktop(rs12x, rs12y);
     rs34x = IniGetInt("_BtnSwapRows34-X", 0); rs34y = IniGetInt("_BtnSwapRows34-Y", 0);
-    rs34Set = (rs34x != 0 || rs34y != 0);
+    rs34Set = (rs34x != 0 || rs34y != 0) && PointOnVirtualDesktop(rs34x, rs34y);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -423,6 +659,11 @@ static void LoadBmps(void) {
         snprintf(p, sizeof p, "%sAwSimUI-%d.bmp", dir, i+1);
         hBmp[i] = (HBITMAP)LoadImageA(NULL, p, IMAGE_BITMAP,
                                        0, 0, LR_LOADFROMFILE);
+        if (!hBmp[i]) {
+            char warning[96];
+            snprintf(warning, sizeof warning, "Could not load UI bitmap AwSimUI-%d.bmp.", i + 1);
+            LogApp(warning);
+        }
     }
 }
 static void FreeBmps(void) {
@@ -462,35 +703,40 @@ static void FlashBtn(DWORD bits, int sect) {
     SetTimer(wMain, IDT_FLASH, 180, NULL);
 }
 
+static void SetAppStatus(const char *status) {
+    if (!wMain) return;
+    char title[128];
+    snprintf(title, sizeof title, "%s  v%s - %s", APP_NAME, APP_VER, status);
+    SetWindowTextA(wMain, title);
+}
+
 /* ═══════════════════════════════════════════════════════════════
-   ENGINE LOGIC  — exact translation of ParseMain-CkBoxes batch
-   btn is 1-indexed (1..11).
-   engVars[1..11] = button values '0'..'5'.
-   engVars[12]    = MPC '1'..'5'.
+    ENGINE LOGIC
+    btn is 1-indexed: 1..2=CR, 3..6=FS, 7..10=Advanced.
 ═══════════════════════════════════════════════════════════════ */
 static void EngineClick(int btn) {
     int v[11] = {0};
     for (int i = 1; i <= 10; i++) v[i] = engVars[i] - '0';
 
-    /* Count active FS buttons (3-7) for run-order slot assignment */
+    /* Count active FS engines (3-6) for run-order slot assignment */
     int hiVal = 0;
-    for (int i = 3; i <= 7; i++) if (v[i] > 0) hiVal++;
+    for (int i = 3; i <= 6; i++) if (v[i] > 0) hiVal++;
 
-    if (v[btn] == 0) {
-        /* ── OFF → ON ──────────────────────────────────────── */
-        if (btn >= 8 && btn <= 10) {
-            /* Overdrive: parent FS = btn - 4 */
-            int par = btn - 4;
-            if (v[par] > 0) {
-                v[btn] = v[par];          /* sync to parent run-order */
-            } else {
-                v[par] = hiVal + 1;       /* activate parent FS too   */
-                v[btn] = hiVal + 1;
-                /* new FS slot added — bump CR so it stays highest    */
+    if (btn >= 7) {
+        int parent = btn - 4;
+        if (v[btn] == 0) {
+            if (v[parent] == 0) {
+                v[parent] = hiVal + 1;
                 for (int i = 1; i <= 2; i++)
                     if (v[i] > 0) v[i]++;
             }
-        } else if (btn >= 3 && btn <= 7) {
+            v[btn] = 1;
+        } else {
+            v[btn] = 0;
+        }
+    } else if (v[btn] == 0) {
+        /* ── OFF → ON ──────────────────────────────────────── */
+        if (btn >= 3 && btn <= 6) {
             /* FS: take the next run-order slot, then bump CR         */
             v[btn] = hiVal + 1;
             for (int i = 1; i <= 2; i++)
@@ -502,17 +748,15 @@ static void EngineClick(int btn) {
         }
     } else {
         /* ── ON → OFF ──────────────────────────────────────── */
-        if (btn >= 3 && btn <= 7) {
+        if (btn >= 3 && btn <= 6) {
             int comp = v[btn];
             v[btn] = 0;
-            if (btn >= 4 && btn <= 6) v[btn + 4] = 0;  /* clear OD mate */
+            v[btn + 4] = 0;  /* clear this engine's Advanced flag */
             /* Compact whole sequence including CR.
                CR is always > comp so it decrements by 1,
                keeping rank = remaining-FS-count + 1. Never hits 0. */
-            for (int i = 1; i <= 10; i++)
+            for (int i = 1; i <= 6; i++)
                 if (v[i] > comp) v[i]--;
-        } else if (btn >= 8) {
-            v[btn] = 0;                   /* OD off; parent unchanged */
         } else {
             v[btn] = 0;                   /* CR toggle off            */
         }
@@ -535,34 +779,18 @@ static void EngineReset(void) {
 /* ═══════════════════════════════════════════════════════════════
    BOXGRID / CYCLE BUTTONS
 ═══════════════════════════════════════════════════════════════ */
-static void ApplyCycle(int state) {
-    cycleState = state;
-    for (int i = 0; i < NCELLS; i++) {
-        int c = i % GCOLS;
-        switch (state) {
-        case 0: occ[i] = customOcc[i]; break;
-        case 1: occ[i] = TRUE;          break;   /* All          */
-        case 2: occ[i] = (c < 5);       break;   /* Left 5 cols  */
-        case 3: occ[i] = (c >= 4);      break;   /* Right 5 cols */
-        case 4: occ[i] = FALSE;         break;   /* None         */
-        }
-    }
-    InvalidateSect(2);
-}
-
 /* Toggle Presets button: cycle the grid through 5 presets each click.
    0=All  1=None  2=Left 5 cols  3=Right 5 cols  4=Top 2 rows.       */
-static int presetIdx = -1;
 static void TogglePresets(void) {
     presetIdx = (presetIdx + 1) % 5;
     for (int i = 0; i < NCELLS; i++) {
         int c = i % GCOLS, r = i / GCOLS;
         switch (presetIdx) {
-        case 0: occ[i] = TRUE;            break;   /* All           */
-        case 1: occ[i] = FALSE;           break;   /* None          */
-        case 2: occ[i] = (c < 5);         break;   /* Left 5 cols   */
-        case 3: occ[i] = (c >= GCOLS-5);  break;   /* Right 5 cols  */
-        case 4: occ[i] = (r < 2);         break;   /* Top 2 rows    */
+        case 0: boxState[i] = BOX_ACTIVE;  break;   /* All           */
+        case 1: boxState[i] = BOX_RESERVE; break;   /* None          */
+        case 2: boxState[i] = (c < 5) ? BOX_ACTIVE : BOX_RESERVE; break;
+        case 3: boxState[i] = (c >= GCOLS-5) ? BOX_ACTIVE : BOX_RESERVE; break;
+        case 4: boxState[i] = (r < 2) ? BOX_ACTIVE : BOX_RESERVE; break;
         }
     }
     InvalidateSect(2);
@@ -598,28 +826,11 @@ static int MagRegDword(const char *value, int def) {
 }
 /* Win + (numpad +/-): dir>0 zoom in, dir<0 zoom out. */
 static void MagZoomKey(int dir) {
-    WORD vk = (dir > 0) ? VK_ADD : VK_SUBTRACT;
-    keybd_event(VK_LWIN, 0, 0, 0);                 Sleep(20);
+    WORD vk = (dir > 0) ? 0x6B : 0x6D;
+    keybd_event(0x5B, 0, 0, 0);                 Sleep(20);
     keybd_event(vk, 0, 0, 0);
     keybd_event(vk, 0, KEYEVENTF_KEYUP, 0);        Sleep(20);
-    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);   Sleep(120);
-}
-
-/* If Magnifier is running and zoomed past 100%, drop it to 100% so screen
-   reads use true pixel coords. Returns the number of steps to later restore
-   via MagRestore(). */
-static int MagDropTo100(void) {
-    if (!MagnifierRunning()) return 0;
-    int zoom = MagRegDword("Magnification", 100);
-    int inc  = MagRegDword("ZoomIncrement", 100);
-    if (inc < 1) inc = 100;
-    if (zoom <= 100) return 0;
-    int steps = (zoom - 100 + inc - 1) / inc;          /* ceil */
-    for (int i = 0; i < steps + 3; i++) MagZoomKey(-1); /* +3 clamps at 100 */
-    return steps;
-}
-static void MagRestore(int steps) {
-    for (int i = 0; i < steps; i++) MagZoomKey(+1);
+    keybd_event(0x5B, 0, KEYEVENTF_KEYUP, 0);   Sleep(120);
 }
 
 /* XEROX: copy the game's current formation into the boxgrid.
@@ -638,13 +849,49 @@ static void MagRestore(int steps) {
    is disturbed): find the top-level window sitting under the boxgrid and
    bring it to the foreground. Used wherever tab focus is needed before
    sending keys. */
-static void FocusGameTab(void) {
-    if (!gridSet) return;
+static BOOL FocusGameTab(void) {
+    if (!gridSet) return FALSE;
     POINT p;  p.x = gx + gw / 2;  p.y = gy + gh / 2;
     HWND root = GetAncestor(WindowFromPoint(p), GA_ROOT);
-    if (!root || root == wMain) return;
-    SetForegroundWindow(root);
-    Sleep(300);
+    if (!root || root == wMain) return FALSE;
+    HWND foreground = GetForegroundWindow();
+    if (foreground && GetAncestor(foreground, GA_ROOT) == root) {
+        gameWindow = root;
+        return TRUE;
+    }
+    for (int attempt = 0; attempt < 3; attempt++) {
+        SetForegroundWindow(root);
+        Sleep(250);
+        HWND foreground = GetForegroundWindow();
+        if (foreground && GetAncestor(foreground, GA_ROOT) == root) {
+            gameWindow = root;
+            return TRUE;
+        }
+    }
+    gameWindow = NULL;
+    return FALSE;
+}
+
+static BOOL EnsureGameForeground(void) {
+    if (!running || !gameWindow || !hStop) return FALSE;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        HWND foreground = GetForegroundWindow();
+        if (foreground && GetAncestor(foreground, GA_ROOT) == gameWindow) return TRUE;
+        if (WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) return FALSE;
+        if (attempt < 2) {
+            SetForegroundWindow(gameWindow);
+            if (WaitForSingleObject(hStop, 180) == WAIT_OBJECT_0) return FALSE;
+        }
+    }
+    LogApp("Automation stopped: game window lost foreground focus.");
+    SetEvent(hStop);
+    return FALSE;
+}
+
+static BOOL GameIsForeground(void) {
+    HWND foreground = GetForegroundWindow();
+    return gameWindow && foreground &&
+           GetAncestor(foreground, GA_ROOT) == gameWindow;
 }
 
 /* Capture the calibrated grid region and flag each cell whose bolt area
@@ -700,12 +947,14 @@ static void XeroxScan(BOOL *out, const char *tag) {
     char *sl = strrchr(path, '\\');
     strcpy(sl ? sl + 1 : path, "_XeroxScan.txt");
     BOOL append = (tag[0] == 'P' && tag[1] == 'O');   /* "POST" */
-    HANDLE hf = CreateFileA(path, append ? FILE_APPEND_DATA : GENERIC_WRITE,
-                            FILE_SHARE_READ, NULL,
-                            append ? OPEN_ALWAYS : CREATE_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hf != INVALID_HANDLE_VALUE) {
-        DWORD wr;  WriteFile(hf, dbg, (DWORD)dlen, &wr, NULL);  CloseHandle(hf);
+    if (debugMode) {
+        HANDLE hf = CreateFileA(path, append ? FILE_APPEND_DATA : GENERIC_WRITE,
+                                FILE_SHARE_READ, NULL,
+                                append ? OPEN_ALWAYS : CREATE_ALWAYS,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE) {
+            DWORD wr;  WriteFile(hf, dbg, (DWORD)dlen, &wr, NULL);  CloseHandle(hf);
+        }
     }
 }
 
@@ -831,31 +1080,6 @@ static int csSpacing(const double *v, int nv, int lo, int hi, int *phaseOut, int
     return 0;
 }
 
-/* Fit a grid axis from a consecutive run of detected lattice lines.
-   The run is either the cell BOUNDARIES (count == ncells+1, i.e. the outer
-   edges were detected too) or the INTERNAL separators (count == ncells-1).
-   We regress line position against boundary index so the intercept is the
-   grid's leading edge. Returns 1 and fills *origin (leading edge) and *cell
-   (cell size); 0 if the run length matches neither layout. */
-static int csFitAxis(const double *sum, const int *cnt, int run0, int runlen,
-                     int ncells, double *origin, double *cell) {
-    int ord0;
-    if (runlen == ncells + 1)      ord0 = 0;   /* boundaries: first line = edge   */
-    else if (runlen == ncells - 1) ord0 = 1;   /* internal: first line = sep #1   */
-    else return 0;
-    double Sm=0, SP=0, Smm=0, SmP=0;
-    for (int t = 0; t < runlen; t++) {
-        double P = sum[run0+t] / cnt[run0+t];
-        int    m = ord0 + t;
-        Sm += m; SP += P; Smm += (double)m*m; SmP += (double)m*P;
-    }
-    double d = runlen*Smm - Sm*Sm;
-    if (d == 0) return 0;
-    *cell   = (runlen*SmP - Sm*SP) / d;
-    *origin = (SP - (*cell)*Sm) / runlen;       /* position at boundary index 0 */
-    return 1;
-}
-
 static BOOL DetectGridColdStart(void) {
     int SW = GetSystemMetrics(SM_CXSCREEN), SH = GetSystemMetrics(SM_CYSCREEN);
     int x0 = 0, rw = SW;                        /* full width               */
@@ -959,6 +1183,7 @@ static BOOL DetectGridColdStart(void) {
 
     BOOL ok = FALSE;
     int dCW=0, dCH=0, dCRUN=0, dRRUN=0, dNBcol=0, dNBrow=0;
+    int dSelCol=-1, dSelRow=-1, dGridX=0, dGridY=0, dGridW=0, dGridH=0;
     if (nb >= 8) {
         int phx, alx, phy, aly;
         int cw = csSpacing(bx, nb, 40, 220, &phx, &alx);    /* cell width  */
@@ -970,46 +1195,96 @@ static BOOL DetectGridColdStart(void) {
             #define CS_KMAX 128
             double colSum[CS_KMAX] = {0}, rowSum[CS_KMAX] = {0};
             int    colCnt[CS_KMAX] = {0}, rowCnt[CS_KMAX] = {0};
+            int    crossings[CS_KMAX][CS_KMAX] = {{0}};
             int    tolx = cw/5 + 2, toly = ch/5 + 2;
             for (int i = 0; i < nb; i++) {
                 int k = (int)floor((bx[i]-phx)/(double)cw + 0.5);
+                int j = (int)floor((by[i]-phy)/(double)ch + 0.5);
+                BOOL onCol = FALSE, onRow = FALSE;
                 if (k >= 0 && k < CS_KMAX) {
                     double d = bx[i]-(phx+(double)k*cw);  if (d < 0) d = -d;
-                    if (d <= tolx) { colSum[k] += bx[i]; colCnt[k]++; }
+                    if (d <= tolx) { colSum[k] += bx[i]; colCnt[k]++; onCol = TRUE; }
                 }
-                int j = (int)floor((by[i]-phy)/(double)ch + 0.5);
                 if (j >= 0 && j < CS_KMAX) {
                     double d = by[i]-(phy+(double)j*ch);  if (d < 0) d = -d;
-                    if (d <= toly) { rowSum[j] += by[i]; rowCnt[j]++; }
+                    if (d <= toly) { rowSum[j] += by[i]; rowCnt[j]++; onRow = TRUE; }
                 }
+                if (onCol && onRow) crossings[k][j]++;
             }
             /* Longest run of consecutive populated column / row lines. */
-            int ck0 = 0, crun = 0, rj0 = 0, rrun = 0, cur, st;
-            cur = 0; st = 0;
+            int crun = 0, rrun = 0, cur;
+            cur = 0;
             for (int k = 0; k < CS_KMAX; k++) {
-                if (colCnt[k]) { if (!cur) st = k; cur++; if (cur > crun) { crun = cur; ck0 = st; } }
+                if (colCnt[k]) { cur++; if (cur > crun) crun = cur; }
                 else cur = 0;
             }
-            cur = 0; st = 0;
+            cur = 0;
             for (int j = 0; j < CS_KMAX; j++) {
-                if (rowCnt[j]) { if (!cur) st = j; cur++; if (cur > rrun) { rrun = cur; rj0 = st; } }
+                if (rowCnt[j]) { cur++; if (cur > rrun) rrun = cur; }
                 else cur = 0;
             }
             for (int k = 0; k < CS_KMAX; k++) if (colCnt[k]) dNBcol++;
             for (int j = 0; j < CS_KMAX; j++) if (rowCnt[j]) dNBrow++;
             dCRUN = crun; dRRUN = rrun;
-            /* Interpret each run as boundaries (edges detected) or internal
-               separators, independently per axis: the bright side-frame means
-               columns usually show 8 internal lines, while the dark top/bottom
-               gap-notches mean rows can show all 5 boundaries. */
-            double gxF, cwF, gyF, chF;
-            if (csFitAxis(colSum, colCnt, ck0, crun, GCOLS, &gxF, &cwF) &&
-                csFitAxis(rowSum, rowCnt, rj0, rrun, GROWS, &gyF, &chF) &&
-                cwF > 20 && chF > 10) {
-                gx = (int)(gxF+0.5);  gy = (int)(gyF+0.5);
-                gw = (int)(cwF*GCOLS+0.5);  gh = (int)(chF*GROWS+0.5);
-                gridSet = TRUE;
-                ok = TRUE;
+            /* Find the densest complete separator block so unrelated aligned
+               rows below or above the grid cannot define its perimeter. */
+            int bestScore = -1, bestK = -1, bestJ = -1;
+            for (int firstK = 0; firstK + GCOLS - 1 < CS_KMAX; firstK++)
+                for (int firstJ = 0; firstJ + GROWS - 1 < CS_KMAX; firstJ++) {
+                    int score = 0;
+                    BOOL complete = TRUE;
+                    for (int ck = 0; ck < GCOLS - 1; ck++)
+                        for (int rj = 0; rj < GROWS - 1; rj++) {
+                            int hits = crossings[firstK + ck][firstJ + rj];
+                            if (!hits) complete = FALSE;
+                            score += hits;
+                        }
+                    if (complete && score > bestScore) {
+                        bestScore = score;
+                        bestK = firstK;
+                        bestJ = firstJ;
+                    }
+                }
+            if (bestK >= 0 && bestJ >= 0) {
+                dSelCol = bestK; dSelRow = bestJ;
+                int nC = GCOLS-1, nR = GROWS-1;
+                double selectedX[GCOLS] = {0}, selectedY[GROWS] = {0};
+                int selectedXC[GCOLS] = {0}, selectedYC[GROWS] = {0};
+                for (int i = 0; i < nb; i++) {
+                    int k = (int)floor((bx[i]-phx)/(double)cw + 0.5);
+                    int j = (int)floor((by[i]-phy)/(double)ch + 0.5);
+                    if (k < bestK || k >= bestK+nC || j < bestJ || j >= bestJ+nR)
+                        continue;
+                    double ex = bx[i] - (phx + (double)k*cw);
+                    double ey = by[i] - (phy + (double)j*ch);
+                    if (fabs(ex) > tolx || fabs(ey) > toly) continue;
+                    selectedX[k-bestK] += bx[i]; selectedXC[k-bestK]++;
+                    selectedY[j-bestJ] += by[i]; selectedYC[j-bestJ]++;
+                }
+                double Sm=0,SX=0,Smm=0,SmX=0;
+                for (int t = 0; t < nC; t++) {
+                    if (!selectedXC[t]) { bestK = -1; break; }
+                    double X = selectedX[t]/selectedXC[t];  int m = t+1;
+                    Sm+=m; SX+=X; Smm+=(double)m*m; SmX+=(double)m*X;
+                }
+                double Sp=0,SY=0,Spp=0,SpY=0;
+                for (int t = 0; t < nR && bestK >= 0; t++) {
+                    if (!selectedYC[t]) { bestK = -1; break; }
+                    double Y = selectedY[t]/selectedYC[t];  int p = t+1;
+                    Sp+=p; SY+=Y; Spp+=(double)p*p; SpY+=(double)p*Y;
+                }
+                double dX = nC*Smm-Sm*Sm, dY = nR*Spp-Sp*Sp;
+                if (bestK >= 0 && dX != 0 && dY != 0) {
+                    double cwF = (nC*SmX-Sm*SX)/dX, gxF = (SX-cwF*Sm)/nC;
+                    double chF = (nR*SpY-Sp*SY)/dY, gyF = (SY-chF*Sp)/nR;
+                    if (cwF > 20 && chF > 10) {
+                        gx = (int)(gxF+0.5);  gy = (int)(gyF+0.5);
+                        gw = (int)(cwF*GCOLS+0.5);  gh = (int)(chF*GROWS+0.5);
+                        dGridX = gx; dGridY = gy; dGridW = gw; dGridH = gh;
+                        gridSet = TRUE;
+                        ok = TRUE;
+                    }
+                }
             }
         }
     }
@@ -1025,13 +1300,19 @@ static BOOL DetectGridColdStart(void) {
             "region x0=%d y0=%d rw=%d rh=%d (screen %dx%d)\r\n"
             "darkPixels=%d  cores=%d  diamonds=%d\r\n"
             "cellW=%d cellH=%d  colLines=%d rowLines=%d  colRun=%d rowRun=%d\r\n"
-            "need colRun>=%d rowRun>=%d  ->  %s\r\n",
+            "selected lattice k=%d j=%d  perimeter=(%d,%d) size=%dx%d\r\n"
+            "need complete %dx%d internal intersections  ->  %s\r\n",
             x0, y0, rw, rh, SW, SH, totalDark, nCore, nb,
             dCW, dCH, dNBcol, dNBrow, dCRUN, dRRUN,
+            dSelCol, dSelRow, dGridX, dGridY, dGridW, dGridH,
             GCOLS-1, GROWS-1, ok ? "LOCKED" : "fell back to user setup");
-        HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                                CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hf != INVALID_HANDLE_VALUE) { DWORD wr; WriteFile(hf, d, (DWORD)dl, &wr, NULL); CloseHandle(hf); }
+        if (debugMode) {
+            HANDLE hf = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hf != INVALID_HANDLE_VALUE) {
+                DWORD wr; WriteFile(hf, d, (DWORD)dl, &wr, NULL); CloseHandle(hf);
+            }
+        }
     }
     return ok;
 }
@@ -1048,10 +1329,8 @@ static void ShowXeroxWait(void) {
     BITMAP bm;
     GetObject(hWork, sizeof bm, &bm);
 
-    /* The XEROX wordmark occupies a 116×27 rectangle at (419,107) in this
-       section; the WORKING image is the same 116×27, so blitting at the same
-       origin overlays it exactly. */
-    int dx = 419;
+     /* Center the 116px WORKING image over the shifted XEROX wordmark. */
+     int dx = 448;
     int dy = top + 107;
 
     HDC dc  = GetDC(wMain);
@@ -1066,6 +1345,12 @@ static void ShowXeroxWait(void) {
 static void XeroxFormation(void) {
     if (!gridSet) return;   /* StartXerox ensures the grid is calibrated */
 
+    if (!FocusGameTab()) {
+        LogApp("XEROX aborted: could not focus the window under the calibrated grid.");
+        SetAppStatus("Game window not focused");
+        return;
+    }
+
     ShowXeroxWait();        /* cover XEROX button with WORKING until we finish */
 
     /* Remember where the cursor was (the XEROX button) to restore later. */
@@ -1073,13 +1358,24 @@ static void XeroxFormation(void) {
 
     /* If Magnifier is running and zoomed past 100%, drop it to 100% so the
        screen capture is at true 1:1 scale; remember how far to restore. */
-    int magSteps = MagDropTo100();
-    if (magSteps) Sleep(200);
+    BOOL mag = MagnifierRunning();
+    int  magSteps = 0;
+    if (mag) {
+        int zoom = MagRegDword("Magnification", 100);
+        int inc  = MagRegDword("ZoomIncrement", 100);
+        if (inc  < 5)   inc  = 100;
+        if (zoom > 100) {
+            magSteps = (zoom - 100 + inc - 1) / inc;             /* ceil */
+            for (int i = 0; i < magSteps + 3; i++) MagZoomKey(-1); /* clamp@100 */
+            Sleep(200);
+        }
+    }
 
     /* Now at 100% zoom and about to scan — re-calibrate the grid from its
        dark intersection diamonds so XEROX stays aligned if it has shifted.
        Keeps the saved grid if the diamonds aren't found. */
-    AutoCalibrateGrid();
+    if (!AutoCalibrateGrid())
+        LogApp("XEROX grid refinement did not lock; using current calibrated dimensions.");
 
     /* Scan #1: record which units are ALREADY disabled (bolt present now).
        Done BEFORE focus — it is only a screen read, so it captures the
@@ -1088,9 +1384,6 @@ static void XeroxFormation(void) {
     XeroxScan(preDis, "PRE");
     int nPre = 0;
     for (int i = 0; i < NCELLS; i++) if (preDis[i]) nPre++;
-
-    /* Focus the game tab (no click — leaves all unit/mirror state intact). */
-    FocusGameTab();
 
     /* Deactivate all units → every occupied box shows a bolt. */
     SendKey('Z');
@@ -1121,11 +1414,12 @@ static void XeroxFormation(void) {
 
     /* Formation = every occupied box EXCEPT those initially disabled. */
     for (int i = 0; i < NCELLS; i++)
-        occ[i] = (allUnits[i] && !preDis[i]);
+        if (allUnits[i] && preDis[i]) boxState[i] = BOX_DISABLED;
+        else boxState[i] = allUnits[i] ? BOX_ACTIVE : BOX_RESERVE;
 
     /* Restore Magnifier zoom last, after all operations. Everything above
        ran at 100%; the clicks use true screen coords so zoom didn't matter. */
-    MagRestore(magSteps);
+    for (int i = 0; i < magSteps; i++) MagZoomKey(+1);
 
     /* Redraw the boxgrid overlay and tidy up; cursor returns to XEROX. */
     SetCursorPos(savePos.x, savePos.y);
@@ -1139,19 +1433,18 @@ static void XeroxFormation(void) {
 }
 
 static void ColToggle(int col) {
-    /* If any cell in this column is active → deactivate all.
-       If all are inactive → activate all.                         */
+    /* Cycle the whole column: Active → Disabled → Reserve → Active. */
     BOOL anyActive = FALSE;
+    BOOL anyDisabled = FALSE;
     for (int r = 0; r < GROWS; r++)
-        if (occ[r*GCOLS + col]) { anyActive = TRUE; break; }
-    if (cycleState != 0) {
-        memcpy(customOcc, occ, sizeof occ);
-        cycleState = 0;
-    }
-    BOOL ns = !anyActive;
+        if (boxState[r*GCOLS + col] == BOX_ACTIVE) anyActive = TRUE;
+        else if (boxState[r*GCOLS + col] == BOX_DISABLED) anyDisabled = TRUE;
+    BYTE nextState = anyActive ? BOX_DISABLED
+                    : anyDisabled ? BOX_RESERVE
+                    : BOX_ACTIVE;
     for (int r = 0; r < GROWS; r++) {
         int idx = r*GCOLS + col;
-        occ[idx] = customOcc[idx] = ns;
+        boxState[idx] = nextState;
     }
     InvalidateSect(2);
     SaveIni();
@@ -1160,17 +1453,33 @@ static void ColToggle(int col) {
 /* ═══════════════════════════════════════════════════════════════
    MOUSE HELPERS
 ═══════════════════════════════════════════════════════════════ */
+static BOOL InputWait(DWORD ms) {
+    if (running && hStop)
+        return WaitForSingleObject(hStop, ms) != WAIT_OBJECT_0;
+    Sleep(ms);
+    return TRUE;
+}
 static void DoClick(int x, int y) {
-    SetCursorPos(x, y);                                Sleep(60);
-    mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0);        Sleep(50);
-    mouse_event(MOUSEEVENTF_LEFTUP,   0,0,0,0);        Sleep(60);
+    if (running && !EnsureGameForeground()) return;
+    if (!InputWait(60)) return;
+    if (!SetCursorPos(x, y)) return;
+    if (!InputWait(50)) return;
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0);
+    if (!InputWait(60)) { mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0); return; }
+    mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0);
 }
 static void DoDbl(int x, int y) {
-    SetCursorPos(x, y);                                Sleep(60);
-    mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0);        Sleep(50);
-    mouse_event(MOUSEEVENTF_LEFTUP,   0,0,0,0);        Sleep(90);
-    mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0);        Sleep(50);
-    mouse_event(MOUSEEVENTF_LEFTUP,   0,0,0,0);        Sleep(60);
+    if (running && !EnsureGameForeground()) return;
+    if (!InputWait(60)) return;
+    if (!SetCursorPos(x, y)) return;
+    if (!InputWait(50)) return;
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0);
+    if (!InputWait(50)) { mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0); return; }
+    mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0);
+    if (!InputWait(90)) return;
+    mouse_event(MOUSEEVENTF_LEFTDOWN, 0,0,0,0);
+    if (!InputWait(50)) { mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0); return; }
+    mouse_event(MOUSEEVENTF_LEFTUP, 0,0,0,0);
 }
 static void Center(int idx, int *ox, int *oy) {
     int c = idx % GCOLS, r = idx / GCOLS;
@@ -1182,6 +1491,8 @@ static void Center(int idx, int *ox, int *oy) {
    KEY HELPER  — sends a single virtual-key press+release via SendInput
 ═══════════════════════════════════════════════════════════════ */
 static void SendKey(WORD vk) {
+    if (running && !EnsureGameForeground()) return;
+    if (running && hStop && WaitForSingleObject(hStop, 0) == WAIT_OBJECT_0) return;
     INPUT inp[2];
     memset(inp, 0, sizeof inp);
     inp[0].type       = INPUT_KEYBOARD;
@@ -1189,7 +1500,7 @@ static void SendKey(WORD vk) {
     inp[1]            = inp[0];
     inp[1].ki.dwFlags = KEYEVENTF_KEYUP;
     SendInput(2, inp, sizeof(INPUT));
-    Sleep(40);
+    InputWait(40);
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1209,120 +1520,219 @@ static void RowBtnXY(int col, int row, int *x, int *y) {
     *y = gy + ROW_DY[row];
 }
 
+static int RowButtonColorKind(COLORREF px) {
+    int r = GetRValue(px), g = GetGValue(px), b = GetBValue(px);
+    if (r >= 115 && r > g * 3 / 2 && r > b * 3 / 2) return 1;
+    if (b >= 90 && b > r * 5 / 4 && b > g * 6 / 5) return 2;
+    return 0;
+}
+
+static int RowButtonRectCount(const int *integral, int stride,
+                              int x1, int y1, int x2, int y2) {
+    return integral[y2*stride+x2] - integral[y1*stride+x2]
+         - integral[y2*stride+x1] + integral[y1*stride+x1];
+}
+
+static BOOL AutoCalibrateRowButtons(void) {
+    if (!gridSet || gw < 90 || gh < 40) return FALSE;
+    int cellW = gw / GCOLS;
+    int cellH = gh / GROWS;
+    int sideLo = (cellH * 50) / 100;
+    int sideHi = (cellH * 75) / 100;
+    if (sideLo < 8) sideLo = 8;
+    if (sideHi < sideLo) sideHi = sideLo;
+    int left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int right = left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int bottom = top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    int scanX = gx - 2*cellW;
+    if (scanX < left) scanX = left;
+    int scanRight = gx;
+    if (scanRight > right) scanRight = right;
+    int rowY[4];
+    for (int row = 0; row < 4; row++)
+        rowY[row] = gy + (int)((row + 0.5) * gh / GROWS);
+    int scanY = rowY[0] - sideHi/2 - 2;
+    int scanBottom = rowY[3] + sideHi/2 + 2;
+    if (scanX >= scanRight || scanY < top || scanBottom > bottom) return FALSE;
+    int scanW = scanRight - scanX;
+    int scanH = scanBottom - scanY;
+    if (scanW <= 0 || scanW > 1024 || scanH <= 0 || scanH > 512)
+        return FALSE;
+    HDC screen = GetDC(NULL);
+    if (!screen) return FALSE;
+    HDC memory = CreateCompatibleDC(screen);
+    HBITMAP bitmap = memory ? CreateCompatibleBitmap(screen, scanW, scanH) : NULL;
+    if (!memory || !bitmap) {
+        if (bitmap) DeleteObject(bitmap);
+        if (memory) DeleteDC(memory);
+        ReleaseDC(NULL, screen);
+        return FALSE;
+    }
+    HBITMAP oldBitmap = (HBITMAP)SelectObject(memory, bitmap);
+    if (!oldBitmap || oldBitmap == HGDI_ERROR ||
+        !BitBlt(memory, 0, 0, scanW, scanH, screen, scanX, scanY, SRCCOPY)) {
+        if (oldBitmap && oldBitmap != HGDI_ERROR) SelectObject(memory, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        ReleaseDC(NULL, screen);
+        return FALSE;
+    }
+
+    BITMAPINFO info;
+    memset(&info, 0, sizeof info);
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = scanW;
+    info.bmiHeader.biHeight = -scanH;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    size_t pixelBytes = (size_t)scanW * (size_t)scanH * 4;
+    unsigned char *pixels = (unsigned char *)malloc(pixelBytes);
+    if (!pixels) {
+        SelectObject(memory, oldBitmap);
+        DeleteObject(bitmap);
+        DeleteDC(memory);
+        ReleaseDC(NULL, screen);
+        return FALSE;
+    }
+    SelectObject(memory, oldBitmap);
+    int copiedRows = GetDIBits(screen, bitmap, 0, (UINT)scanH, pixels,
+                               &info, DIB_RGB_COLORS);
+    DeleteObject(bitmap);
+    DeleteDC(memory);
+    ReleaseDC(NULL, screen);
+    if (copiedRows != scanH) { free(pixels); return FALSE; }
+
+    int integralStride = scanW + 1;
+    size_t integralCount = (size_t)integralStride * (scanH + 1);
+    int *redIntegral = (int *)calloc(integralCount, sizeof(int));
+    int *blueIntegral = (int *)calloc(integralCount, sizeof(int));
+    if (!redIntegral || !blueIntegral) {
+        free(redIntegral); free(blueIntegral); free(pixels);
+        return FALSE;
+    }
+    for (int y = 1; y <= scanH; y++) {
+        int redRow = 0, blueRow = 0;
+        for (int x = 1; x <= scanW; x++) {
+            const unsigned char *pixel = pixels + (size_t)(y-1)*scanW*4
+                                       + (size_t)(x-1)*4;
+            int kind = RowButtonColorKind(RGB(pixel[2], pixel[1], pixel[0]));
+            redRow += kind == 1;
+            blueRow += kind == 2;
+            redIntegral[y*integralStride+x] =
+                redIntegral[(y-1)*integralStride+x] + redRow;
+            blueIntegral[y*integralStride+x] =
+                blueIntegral[(y-1)*integralStride+x] + blueRow;
+        }
+    }
+    free(pixels);
+
+    double bestScore = -1.0;
+    int bestMirrorX = 0, bestShiftLeftX = 0, bestShiftRightX = 0;
+    int bestSide = 0, bestGap = 0;
+    double bestMinDensity = 0.0;
+    for (int side = sideLo; side <= sideHi; side++) {
+        int half = side / 2;
+        int mirrorMin = scanX + half;
+        int mirrorMax = gx - side/2 - side;
+        int maxGap = side / 4;
+        for (int mirrorX = mirrorMin; mirrorX <= mirrorMax; mirrorX++)
+            for (int gap = 0; gap <= maxGap; gap++) {
+                double score = 0.0, minDensity = 1.0;
+                int validRows = 0;
+                int pairX1 = mirrorX + half + gap;
+                int pairX2 = pairX1 + 2*side;
+                for (int row = 0; row < GROWS; row++) {
+                    int y1 = rowY[row] - half - scanY;
+                    int y2 = y1 + side;
+                    int sqX1 = mirrorX - half - scanX;
+                    int sqX2 = sqX1 + side;
+                    int px1 = pairX1 - scanX;
+                    int px2 = pairX2 - scanX;
+                    int py1 = y1, py2 = y2;
+                    if (sqX1 < 0 || px2 > scanW || py1 < 0 || py2 > scanH)
+                        continue;
+                    int squareArea = side*side;
+                    int pairArea = 2*side*side;
+                    int squareRed = RowButtonRectCount(redIntegral, integralStride,
+                                                       sqX1, py1, sqX2, py2);
+                    int squareBlue = RowButtonRectCount(blueIntegral, integralStride,
+                                                        sqX1, py1, sqX2, py2);
+                    int pairRed = RowButtonRectCount(redIntegral, integralStride,
+                                                     px1, py1, px2, py2);
+                    int pairBlue = RowButtonRectCount(blueIntegral, integralStride,
+                                                      px1, py1, px2, py2);
+                    int squareColor = squareRed >= squareBlue ? 1 : 2;
+                    double squareDensity = (double)(squareColor == 1 ? squareRed : squareBlue)
+                                         / squareArea;
+                    int pairColorCount = squareColor == 1 ? pairRed : pairBlue;
+                    double pairDensity = (double)pairColorCount / pairArea;
+                    if (squareDensity < 0.20 || pairDensity < 0.18) continue;
+                    double rowScore = squareDensity + pairDensity;
+                    score += rowScore;
+                    if (squareDensity < minDensity) minDensity = squareDensity;
+                    if (pairDensity < minDensity) minDensity = pairDensity;
+                    validRows++;
+                }
+                if (validRows == GROWS && minDensity >= 0.18 && score > bestScore) {
+                    bestScore = score;
+                    bestMirrorX = mirrorX;
+                    bestSide = side;
+                    bestGap = gap;
+                    bestShiftLeftX = pairX1 + half;
+                    bestShiftRightX = pairX2 - half;
+                    bestMinDensity = minDensity;
+                }
+            }
+    }
+    free(redIntegral);
+    free(blueIntegral);
+
+    if (bestScore < 0.0) {
+        char diagnostic[192];
+        snprintf(diagnostic, sizeof diagnostic,
+                 "Row Ops shape scan failed: grid=(%d,%d %dx%d), searchX=%d..%d side=%d..%d.",
+                 gx, gy, gw, gh, scanX, scanRight, sideLo, sideHi);
+        LogApp(diagnostic);
+        SetAppStatus("Row buttons not detected; manual setup needed");
+        return FALSE;
+    }
+    rb1x = bestMirrorX; rb1y = rowY[0]; rb1Set = TRUE;
+    rb2x = bestShiftRightX; rb2y = rowY[3]; rb2Set = TRUE;
+    SaveIni();
+    char diagnostic[192];
+    snprintf(diagnostic, sizeof diagnostic,
+             "Row Ops shape scan found mirror=(%d,%d), shift-left-x=%d, shift-right=(%d,%d), side=%d gap=%d density=%.2f.",
+             rb1x, rb1y, bestShiftLeftX, rb2x, rb2y,
+             bestSide, bestGap, bestMinDensity);
+    LogApp(diagnostic);
+    return TRUE;
+}
+
 /* True if column col (0-indexed) has at least one active cell. */
 static BOOL ColIsActive(int col) {
     for (int r = 0; r < GROWS; r++)
-        if (occ[r * GCOLS + col]) return TRUE;
+        if (boxState[r * GCOLS + col] == BOX_ACTIVE) return TRUE;
     return FALSE;
 }
 
-/* ── Engine 7: Quick Optimize (FS5) — 90-second time-limited cycle ── */
-static BOOL RunQuickOpt(void) {
-    DWORD t0   = GetTickCount();
-    DWORD tLim = 90000;   /* 90 s */
-
-    /* Snapshot active columns */
-    int  activeCols[GCOLS]; int nAC = 0;
-    for (int c = 0; c < GCOLS; c++)
-        for (int r = 0; r < GROWS; r++)
-            if (occ[r*GCOLS + c]) { activeCols[nAC++] = c; break; }
-    if (nAC == 0) return TRUE;
-
-    BOOL colUsed[GCOLS] = {0};
-    BOOL rowUsed[GROWS] = {0};
-
-    while (GetTickCount() - t0 < tLim) {
-
-        /* ─ Column phase: pick unused active column at random ─ */
-        int pool[GCOLS]; int np = 0;
-        for (int i = 0; i < nAC; i++)
-            if (!colUsed[activeCols[i]]) pool[np++] = activeCols[i];
-        if (np == 0) {                       /* all used — reset */
-            memset(colUsed, 0, sizeof colUsed);
-            for (int i = 0; i < nAC; i++) pool[np++] = activeCols[i];
-        }
-        int col = pool[np > 1 ? rand() % np : 0];
-        colUsed[col] = TRUE;
-
-        int sdX  = gx + 55 + (int)((double)col * gw / GCOLS);
-        int btnY = gy - 15;
-        for (int i = 0; i < 3; i++) {
-            DoClick(sdX, btnY);
-            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
-        }
-        DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
-        if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
-
-        if (GetTickCount() - t0 >= tLim) break;
-
-        /* ─ Row phase: pick unused row at random ─ */
-        int rpool[GROWS]; int rp = 0;
-        for (int r = 0; r < GROWS; r++)
-            if (!rowUsed[r]) rpool[rp++] = r;
-        if (rp == 0) {                       /* all used — reset */
-            memset(rowUsed, 0, sizeof rowUsed);
-            for (int r = 0; r < GROWS; r++) rpool[rp++] = r;
-        }
-        int row = rpool[rp > 1 ? rand() % rp : 0];
-        rowUsed[row] = TRUE;
-
-        int slX, slY; RowBtnXY(1, row, &slX, &slY);
-        DoClick(slX, slY);
-        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
-
-        int srX, srY; RowBtnXY(2, row, &srX, &srY);
-        DoClick(srX, srY); DoClick(srX, srY);   /* twice */
-        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
-
-        DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
-        if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
-    }
-    return TRUE;
-}
-
-/* ── Engine 4: Scout DZ (FS2) — fixed keystroke sequence ─────── */
-static BOOL RunScoutDZ(void) {
-#define E4K(vk) do { SendKey(vk); \
-    if (WaitForSingleObject(hStop,3333)==WAIT_OBJECT_0) return FALSE; } while(0)
-
-    /* Block 1: 4×8, mirror-h, 4×8, then Target.
-       NUMPAD1 = mirror-horizontal in TABS (NUMPAD7 there toggles the
-       Stats window, which closed/minimized the sim panel). */
-    for (int i = 0; i < 8; i++) E4K(VK_NUMPAD4);
-    E4K(VK_NUMPAD1);
-    for (int i = 0; i < 8; i++) E4K(VK_NUMPAD4);
-    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
-    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
-
-    /* Block 2: 8×3, 4, 2×2, 6, 6, 8×2, then Target */
-    for (int i = 0; i < 3; i++) E4K(VK_NUMPAD8);
-    E4K(VK_NUMPAD4);
-    for (int i = 0; i < 2; i++) E4K(VK_NUMPAD2);
-    E4K(VK_NUMPAD6);
-    E4K(VK_NUMPAD6);
-    for (int i = 0; i < 2; i++) E4K(VK_NUMPAD8);
-    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
-    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
-
-#undef E4K
-    return TRUE;
-}
 
 /* ═══════════════════════════════════════════════════════════════
-   ENGINE 5  — Col.Ops (FS3)
-   For each active column: optionally Mirror, ShiftDown ×3, refresh.
+    COLUMN OPS
+   For each active column: ShiftUp ×3, refresh.
 ═══════════════════════════════════════════════════════════════ */
-static BOOL ColOpsPass(BOOL extended) {
+static BOOL ColOpsPass(BOOL advanced) {
     int btnY = gy - 15;
     for (int col = 0; col < GCOLS; col++) {
         if (!ColIsActive(col)) continue;
-        int sdX = gx + 55 + (int)((double)col * gw / GCOLS);  /* ShiftDown  */
-        int mrX = gx + 25 + (int)((double)col * gw / GCOLS);  /* Mirror     */
-
-        if (extended) {
-            DoClick(mrX, btnY);
+        int sdX = gx + 54 + (int)((double)col * gw / GCOLS);  /* ShiftUp  */
+        if (advanced) {
+            int flipX = gx + 27 + (int)((double)col * gw / GCOLS);
+            DoClick(flipX, btnY);
             if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
         }
+
         for (int k = 0; k < 3; k++) {
             DoClick(sdX, btnY);
             if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
@@ -1333,24 +1743,27 @@ static BOOL ColOpsPass(BOOL extended) {
     return TRUE;
 }
 
-/* Run twice; each round optionally followed by an Overdrive (Mirror) pass. */
 static BOOL RunColOps(void) {
-    BOOL ext = (engVars[9] != '0');    /* OD for FS3 Col.Ops = Overdrive */
-    for (int round = 0; round < 2; round++) {
-        if (!ColOpsPass(FALSE))       return FALSE;
-        if (ext && !ColOpsPass(TRUE)) return FALSE;
-    }
+    if (!ColOpsPass(FALSE)) return FALSE;
+    if (engVars[7] != '0' && !ColOpsPass(TRUE)) return FALSE;
+    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
     return TRUE;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ENGINE 6  — Row Ops (FS4)
-   Rows 4→1: DoubleClick(SR), click(SL), DoubleClick(SL), click(SL),
-   then a Target refresh. Run once, repeated if Overdrive is on.
+    ROW OPS
+    Rows 4→1: DoubleClick(SR), click(SL), DoubleClick(SL), click(SL),
+     then a Target refresh.
 ═══════════════════════════════════════════════════════════════ */
-static BOOL RowOpsPass(void) {
+static BOOL RowOpsPass(BOOL advanced) {
     for (int row = 3; row >= 0; row--) {
-        int srX, srY, slX, slY;
+        int mrX, mrY, srX, srY, slX, slY;
+        if (advanced) {
+            RowBtnXY(0, row, &mrX, &mrY);
+            DoClick(mrX, mrY);
+            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        }
         RowBtnXY(2, row, &srX, &srY);
         RowBtnXY(1, row, &slX, &slY);
 
@@ -1368,22 +1781,22 @@ static BOOL RowOpsPass(void) {
     return TRUE;
 }
 
-/* Engine 6: one pass, repeated once more if Overdrive is on. */
 static BOOL RunRowOps(void) {
-    BOOL ext = (engVars[10] != '0');   /* OD for FS4 Row Ops = Overdrive */
     /* Game focus and double-click priming are already done by AutoRun's
        opening double-click, so RowOpsPass can start directly. */
-    if (!RowOpsPass()) return FALSE;
-    if (ext && !RowOpsPass()) return FALSE;
+    if (!RowOpsPass(FALSE)) return FALSE;
+    if (engVars[8] != '0' && !RowOpsPass(TRUE)) return FALSE;
+    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
     return TRUE;
 }
 
 /* ═══════════════════════════════════════════════════════════════
-   ENGINE 3  — Permute Rows (FS1)
+    PERMUTE
    Calibrate two buttons (Swap 1-2, Swap 3-4); Swap 2-3 is their
-   midpoint. Run a fixed 23-step swap sequence, then a refresh.
+    midpoint. Run 23 swaps; Advanced sends 7 and repeats the swaps.
 ═══════════════════════════════════════════════════════════════ */
-static BOOL RunPermuteRows(void) {
+static BOOL RunPermute(void) {
     /* rs23 derived as midpoint of rs12 and rs34 */
     int bx[3] = { rs12x, (rs12x+rs34x)/2, rs34x };
     int by[3] = { rs12y, (rs12y+rs34y)/2, rs34y };
@@ -1394,20 +1807,61 @@ static BOOL RunPermuteRows(void) {
         0,1,0,1, 2,1,2,1,
         0,1,0,1, 2,1,2
     };
-    for (int i = 0; i < 23; i++) {
-        DoClick(bx[SEQ[i]], by[SEQ[i]]);
-        if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+    int passes = (engVars[9] != '0') ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
+        if (pass == 1) {
+            SendKey(0x37);
+            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        }
+        for (int i = 0; i < 23; i++) {
+            DoClick(bx[SEQ[i]], by[SEQ[i]]);
+            if (WaitForSingleObject(hStop, 3333) == WAIT_OBJECT_0) return FALSE;
+        }
     }
     DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
     if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
     return TRUE;
 }
 
+/* ── Scout — fixed keystroke sequence ─────────────────────── */
+static BOOL RunScout(void) {
+#define E4K(vk) do { SendKey(vk); \
+    if (WaitForSingleObject(hStop,3333)==WAIT_OBJECT_0) return FALSE; } while(0)
+
+    /* Standard pattern. */
+    for (int i = 0; i < 8; i++) E4K(0x34);
+    E4K(0x37);
+    for (int i = 0; i < 8; i++) E4K(0x34);
+
+    /* Advanced adds a second pattern after the standard one. */
+    if (engVars[10] != '0') {
+        E4K(0x39);
+        for (int i = 0; i < 8; i++) E4K(0x34);
+        E4K(0x37);
+        for (int i = 0; i < 8; i++) E4K(0x34);
+    }
+
+    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+    if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) return FALSE;
+
+    /* Remaining pattern; the two 6 presses have no long pause between them. */
+    for (int i = 0; i < 3; i++) E4K(0x38);
+    E4K(0x34);
+    for (int i = 0; i < 2; i++) E4K(0x32);
+    SendKey(0x36);
+    SendKey(0x36);
+    if (WaitForSingleObject(hStop,3333)==WAIT_OBJECT_0) return FALSE;
+    for (int i = 0; i < 2; i++) E4K(0x38);
+    DoDbl(tgtX[activeTgt], tgtY[activeTgt]);
+
+#undef E4K
+    return TRUE;
+}
 
 /* ═══════════════════════════════════════════════════════════════
    AUTOMATION THREAD  — two-phase dispatcher
    ─────────────────────────────────────────────────────────────
-   Phase 1: Active FS engines [3..7] run once each, in run-order rank.
+    Phase 1: Active FS engines [3..6] run once each, in run-order rank.
    Phase 2: Active CR engine  [1..2] (AwSim/Decoy) runs indefinitely;
             if none is selected, the thread stops after Phase 1.
 ═══════════════════════════════════════════════════════════════ */
@@ -1418,26 +1872,26 @@ DWORD WINAPI AutoRun(LPVOID _u) {
     static const int MV_ORG[5] = { 0, 1, 2, 0, 1 };
     static const int MV_DST[5] = { 1, 2, 0, 1, 2 };
 
-    /* Let the window finish minimising and the game tab regain focus
-       before clicking — otherwise the focusing double-click is lost to
-       the minimise transition and SendKey input goes nowhere. */
-    if (WaitForSingleObject(hStop, 400) == WAIT_OBJECT_0) goto stop;
+     /* Allow the UI thread to finish restoring game focus after minimizing. */
+     if (WaitForSingleObject(hStop, 1000) == WAIT_OBJECT_0) goto stop;
 
-    /* Focus the game tab (no click) so subsequent SendKey input is
-       delivered to the game, not the desktop. */
-    FocusGameTab();
+    /* The UI thread focused the game directly from the Start click. Do not
+       attempt to steal foreground focus again from this worker thread. */
+    if (!GameIsForeground()) {
+        LogApp("Automation stopped: game was not foreground after AwSim minimized.");
+        goto stop;
+    }
     if (WaitForSingleObject(hStop, 500) == WAIT_OBJECT_0) goto stop;
 
     /* ── Phase 1: FS engines in run-order value (1 = first) ─── */
-    for (int ord = 1; ord <= 5; ord++) {
-        for (int fsi = 3; fsi <= 7; fsi++) {
+    for (int ord = 1; ord <= 4; ord++) {
+        for (int fsi = 3; fsi <= 6; fsi++) {
             if ((engVars[fsi] - '0') != ord) continue;
             switch (fsi) {
-            case 3:  if (!RunPermuteRows()) goto stop; break;  /* Permute Rows   */
-            case 4:  if (!RunScoutDZ())  goto stop; break;  /* Scout DZ   */
-            case 5:  if (!RunColOps())   goto stop; break;  /* Col.Ops    */
-            case 6:  if (!RunRowOps())   goto stop; break;  /* Row Ops    */
-            case 7:  if (!RunQuickOpt())  goto stop; break;  /* Quick Optimize */
+            case 3:  if (!RunColOps()) goto stop; break;
+            case 4:  if (!RunRowOps()) goto stop; break;
+            case 5:  if (!RunPermute()) goto stop; break;
+            case 6:  if (!RunScout()) goto stop; break;
             }
         }
     }
@@ -1457,8 +1911,8 @@ DWORD WINAPI AutoRun(LPVOID _u) {
             int aList[NCELLS], na = 0;
             int iList[NCELLS], ni = 0;
             for (int i = 0; i < NCELLS; i++) {
-                if (occ[i]) aList[na++] = i;
-                else        iList[ni++] = i;
+                if (boxState[i] == BOX_ACTIVE) aList[na++] = i;
+                else if (boxState[i] == BOX_RESERVE) iList[ni++] = i;
             }
 
             BOOL ok;
@@ -1533,8 +1987,19 @@ LRESULT CALLBACK ProcHook(int code, WPARAM wp, LPARAM lp) {
         if (wp == WM_RBUTTONDOWN) {
             PostMessage(wMain, WM_STOPAUTO, 0, 0);  return 1;
         }
-        if (ms->pt.x <= EDGE_X) {
-            PostMessage(wMain, WM_EXITAPP, 0, 0);   return 1;
+        if (wp == WM_MOUSEMOVE && !(ms->flags & LLMHF_INJECTED)) {
+            int edgeX = GetSystemMetrics(SM_XVIRTUALSCREEN) + EDGE_X;
+            if (ms->pt.x > edgeX) edgeExitArmed = TRUE;
+            else if (edgeExitArmed) {
+                char diagnostic[128];
+                snprintf(diagnostic, sizeof diagnostic,
+                         "Emergency exit triggered by cursor reaching left edge at (%ld,%ld).",
+                         ms->pt.x, ms->pt.y);
+                LogApp(diagnostic);
+                edgeExitArmed = FALSE;
+                PostMessage(wMain, WM_EXITAPP, 0, 0);
+                return 1;
+            }
         }
     }
     return CallNextHookEx(hHook, code, wp, lp);
@@ -1545,65 +2010,140 @@ LRESULT CALLBACK ProcHook(int code, WPARAM wp, LPARAM lp) {
 ═══════════════════════════════════════════════════════════════ */
 static void StartAuto(void) {
     if (running) return;
-    /* Grid capture needed only for CR engines and Engine 7 */
+    /* Grid capture is needed by CR engines, Column Ops and Row Ops. */
     {
         BOOL needsGrid = FALSE;
         for (int i = 1; i <= 2; i++) if (engVars[i] != '0') { needsGrid = TRUE; break; }
-        if (engVars[7] != '0') needsGrid = TRUE;  /* Quick Opt (E7) */
-        if (engVars[5] != '0') needsGrid = TRUE;  /* Col.Ops   */
-        if (engVars[6] != '0') needsGrid = TRUE;  /* Row Ops   */
-        if (needsGrid && !gridSet) { pendingStart = TRUE; StartCap(1); return; }
+        if (engVars[3] != '0') needsGrid = TRUE;
+        if (engVars[4] != '0') needsGrid = TRUE;
+        if (needsGrid && !gridSet) {
+            char diagnostic[192];
+            snprintf(diagnostic, sizeof diagnostic,
+                     "Start grid retry: saved=(%d,%d %dx%d), desktop=(%d,%d %dx%d).",
+                     gx, gy, gw, gh,
+                     GetSystemMetrics(SM_XVIRTUALSCREEN),
+                     GetSystemMetrics(SM_YVIRTUALSCREEN),
+                     GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                     GetSystemMetrics(SM_CYVIRTUALSCREEN));
+            LogApp(diagnostic);
+            if (DetectGridColdStart()) {
+                SaveIni();
+                LogApp("Start grid retry succeeded; using automatically detected calibration.");
+            } else {
+                LogApp("Start grid retry failed; requesting manual corner capture.");
+                pendingStart = TRUE;
+                SetAppStatus("Grid calibration required");
+                StartCap(1);
+                return;
+            }
+        }
     }
     /* Capture active target coord if not set */
-    if (!tgtSet[activeTgt])   { pendingStart = TRUE; StartCap(2 + activeTgt); return; }
-    /* Row button calibration for Quick Opt (E7) and Row Ops (E6) */
-    if (engVars[7] != '0' || engVars[6] != '0') {
-        if (!rb1Set) { pendingStart = TRUE; StartCap(7); return; }
-        if (!rb2Set) { pendingStart = TRUE; StartCap(8); return; }
+    if (!tgtSet[activeTgt]) {
+        pendingStart = TRUE; SetAppStatus("Target calibration required");
+        StartCap(2 + activeTgt); return;
     }
-    /* Permute Rows (swap) calibration (E3 = FS1) */
-    if (engVars[3] != '0') {
-        if (!rs12Set) { pendingStart = TRUE; StartCap(9);  return; }
-        if (!rs34Set) { pendingStart = TRUE; StartCap(10); return; }
+    /* Row button calibration for Row Ops. */
+    if (engVars[4] != '0') {
+        BOOL haveSavedRowCalibration = rb1Set && rb2Set;
+        if (!AutoCalibrateRowButtons() && !haveSavedRowCalibration) {
+            LogApp("Automatic Row Ops button detection failed; requesting manual calibration.");
+        }
+        if (!rb1Set) { pendingStart = TRUE; SetAppStatus("Row button calibration required"); StartCap(7); return; }
+        if (!rb2Set) { pendingStart = TRUE; SetAppStatus("Row button calibration required"); StartCap(8); return; }
+    }
+    /* Permute (swap) calibration. */
+    if (engVars[5] != '0') {
+        if (!rs12Set) { pendingStart = TRUE; SetAppStatus("Swap button calibration required"); StartCap(9);  return; }
+        if (!rs34Set) { pendingStart = TRUE; SetAppStatus("Swap button calibration required"); StartCap(10); return; }
     }
     /* Which engines are active? Verify minimums per type. */
     int crEngine = 0;
     for (int i = 1; i <= 2; i++) if (engVars[i] != '0') { crEngine = i; break; }
     BOOL hasFS = FALSE;
-    for (int i = 3; i <= 7; i++) if (engVars[i] != '0') { hasFS = TRUE; break; }
-    if (!crEngine && !hasFS) return;
+    for (int i = 3; i <= 6; i++) if (engVars[i] != '0') { hasFS = TRUE; break; }
+    if (!crEngine && !hasFS) { SetAppStatus("Select an engine first"); return; }
 
     if (crEngine) {
         int mpc  = engVars[11] - '0';
         int need = (mpc == 1) ? 2 : 3;
         int na = 0, ni = 0;
-        for (int i = 0; i < NCELLS; i++) { if (occ[i]) na++; else ni++; }
+        for (int i = 0; i < NCELLS; i++) {
+            if (boxState[i] == BOX_ACTIVE) na++;
+            else if (boxState[i] == BOX_RESERVE) ni++;
+        }
         switch (crEngine) {
-        case 2:  if (na < need-1 || ni < 1) return;  break;
-        default: if (na < need)             return;  break;
+        case 2:  if (na < need-1 || ni < 1) { SetAppStatus("Boxgrid has too few usable cells"); return; } break;
+        default: if (na < need)             { SetAppStatus("Boxgrid has too few active cells"); return; } break;
         }
     }
-    /* Col.Ops needs at least one active column */
-    if (engVars[5] != '0') {
+    /* Column Ops needs at least one active column. */
+    if (engVars[3] != '0') {
         BOOL any = FALSE;
-        for (int i = 0; i < NCELLS; i++) if (occ[i]) { any = TRUE; break; }
-        if (!any) return;
+        for (int i = 0; i < NCELLS; i++)
+            if (boxState[i] == BOX_ACTIVE) { any = TRUE; break; }
+        if (!any) { SetAppStatus("Column Ops needs an active cell"); return; }
+    }
+    /* Start is called from the user's click, so foreground handoff is allowed
+       here. A worker thread after minimizing is not reliably allowed to steal it. */
+    if (!FocusGameTab()) {
+        SetAppStatus("Click the game once, then press Start");
+        LogApp("Automation not started: game focus handoff failed on Start click.");
+        return;
     }
     /* All prerequisites met — launch thread */
     hStop   = CreateEventA(NULL, TRUE, FALSE, NULL);
+    if (!hStop) { SetAppStatus("Could not create stop event"); LogApp("CreateEvent failed while starting automation."); return; }
     hHook   = SetWindowsHookExA(WH_MOUSE_LL, ProcHook, hI, 0);
+    if (!hHook) {
+        CloseHandle(hStop); hStop = NULL;
+        SetAppStatus("Could not install stop hook"); LogApp("SetWindowsHookEx failed while starting automation.");
+        return;
+    }
+    edgeExitArmed = FALSE;
+    POINT startCursor;
+    if (GetCursorPos(&startCursor))
+        edgeExitArmed = startCursor.x > GetSystemMetrics(SM_XVIRTUALSCREEN) + EDGE_X;
     running = TRUE;
+    SetAppStatus("Running - right-click to stop");
     InvalidateSect(0);    /* paint RIGHT CLICK / TO STOP over Start button */
-    /* Drop always-on-top while running so game window can come to front */
-    SetWindowPos(wMain, HWND_NOTOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
-    ShowWindow(wMain, SW_MINIMIZE);   /* minimise immediately, no delay */
+    SetWindowPos(wMain, HWND_NOTOPMOST, 0,0,0,0,
+                 SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     hThread = CreateThread(NULL, 0, AutoRun, NULL, 0, NULL);
+    if (!hThread) {
+        running = FALSE;
+        UnhookWindowsHookEx(hHook); hHook = NULL;
+        CloseHandle(hStop); hStop = NULL;
+        SetWindowPos(wMain, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        SetAppStatus("Could not start automation thread");
+        LogApp("CreateThread failed while starting automation.");
+        InvalidateSect(0);
+        return;
+    }
+    ShowWindow(wMain, SW_MINIMIZE);   /* minimise only after successful launch */
+    if (gameWindow) {
+        BOOL focused = FALSE;
+        for (int attempt = 0; attempt < 10; attempt++) {
+            SetForegroundWindow(gameWindow);
+            Sleep(50);
+            if (GameIsForeground()) { focused = TRUE; break; }
+        }
+        if (!focused) {
+            LogApp("Could not retain game foreground after minimizing AwSim; requesting stop.");
+            SetEvent(hStop);
+        }
+    }
 }
 
-static void StopAuto(void) {
-    if (!running) return;
+static BOOL StopAuto(void) {
+    if (!running) return TRUE;
     SetEvent(hStop);
-    WaitForSingleObject(hThread, 5000);
+    if (WaitForSingleObject(hThread, 0) != WAIT_OBJECT_0) {
+        SetAppStatus("Stopping automation...");
+        SetTimer(wMain, IDT_STOP_POLL, 50, NULL);
+        return FALSE;
+    }
+    KillTimer(wMain, IDT_STOP_POLL);
     CloseHandle(hThread); hThread = NULL;
     CloseHandle(hStop);   hStop   = NULL;
     if (hHook) { UnhookWindowsHookEx(hHook); hHook = NULL; }
@@ -1613,6 +2153,8 @@ static void StopAuto(void) {
     ShowWindow(wMain, SW_RESTORE);
     SetWindowPos(wMain, HWND_TOPMOST, 0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
     SetForegroundWindow(wMain);
+    SetAppStatus("Ready");
+    return TRUE;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -1628,6 +2170,13 @@ static void StartCap(int mode) {
     wCap = CreateWindowExA(WS_EX_TOPMOST | WS_EX_LAYERED,
                            CLS_CAP, "", WS_POPUP,
                            sx, sy, sw, sh, NULL, NULL, hI, NULL);
+    if (!wCap) {
+        pendingStart = FALSE; pendingXerox = FALSE;
+        LogApp("Could not create calibration overlay.");
+        SetAppStatus("Could not open calibration overlay");
+        return;
+    }
+    SetAppStatus("Calibration in progress");
     SetLayeredWindowAttributes(wCap, 0, 140, LWA_ALPHA);
     ShowWindow(wCap, SW_SHOW);
     SetForegroundWindow(wCap);
@@ -1639,6 +2188,11 @@ static void EndCap(void) {
     if (!wCap) return;
     DestroyWindow(wCap);  wCap = NULL;  capMode = 0;
     InvalidateSect(0);
+    if (!pendingStart && !pendingXerox) SetAppStatus("Ready");
+    if (app.taskbarPromptPending) {
+        app.taskbarPromptPending = FALSE;
+        PostMessage(wMain, WM_TASKBARPROMPT, 0, 0);
+    }
     if (pendingStart) {
         pendingStart = FALSE;
         PostMessage(wMain, WM_STARTDEFER, 0, 0);
@@ -1653,7 +2207,7 @@ static void EndCap(void) {
    WM_XEROXDEFER once done. Focus is windowless, so no row-button setup. */
 static void StartXerox(void) {
     if (running) return;
-    if (!gridSet) { pendingXerox = TRUE; StartCap(1); return; }
+    if (!gridSet) { pendingXerox = TRUE; SetAppStatus("Grid calibration required"); StartCap(1); return; }
     XeroxFormation();
 }
 
@@ -1664,30 +2218,24 @@ static void StartXerox(void) {
 ═══════════════════════════════════════════════════════════════ */
 typedef struct { const char *title; const char *body; } HelpTopic;
 static const HelpTopic HELP[] = {
-{ "Getting Started",
-  "AwSim drives the TABS V2 battle simulator from a small always-on-top "
-  "overlay.\n\nCalibrate once with Setup, pick a target, choose an engine, "
-  "then press Start. Right-click (or NUM5) stops a run." },
-{ "Engines (FS)",
-  "The Finite-Duration list holds five engines: Permute Rows, Scout for DZ, "
-  "Columns Ops, Rows Ops and Quick Optimize.\n\nEach cycles a fixed key "
-  "sequence against the active target. Overdrive (red tic) boosts rows 2-4." },
-{ "Targets",
-  "Five targets map to the letters A W S i m: CY, DF, Deff, CC and CY*.\n\n"
-  "Click a tile once to set its coordinate, three times to reset it. The "
-  "active target's letter lights red in the header." },
-{ "XEROX Capture",
-  "XEROX reads the current unit formation from the game and copies it into "
-  "the boxgrid.\n\nCalibrate the grid first (Setup). While it runs, the red "
-  "WORKING badge covers the button - don't move the mouse until it clears." },
-{ "Moves Per Cycle",
-  "The Moves-Per-Cycle value (1-5) sets how many moves each engine pass "
-  "makes before re-targeting.\n\nUse the + button to step it; the white "
-  "7-segment digit shows the current setting." },
-{ "Calibration / Setup",
-  "Setup captures the screen coordinates AwSim clicks: the grid corners, the "
-  "row buttons and the swap buttons.\n\nClick Setup, then follow the on-screen "
-  "prompt for each point. Press Esc to cancel a capture." },
+    {"Introduction",
+     "AwSim for CC:TA improves game play by managing the work of moving units around the battlefield.\n\nUse it before hitting a new target, and between attacks.\n\nInflicted damage will rise over time while RT will typically decrease."},
+    {"Getting Started",
+     "AwSim drives the TABS V2 battle simulator script from a small always-on-top overlay. TABS V2 is required.\n\nPick a Target, choose an Engine, then press Start.\n\nRight-click to interrupt operation.\n\nFor a quick exit while operating, move cursor to the far left."},
+    {"Targets",
+     "Five Targets map to the Target columns in TABS V2: CY, DF, Deff, CC and CY*.\n\nClick a tile once to set as the current Target. Follow the prompt and set its coordinates by pointing to the data region of the TABS V2 column of that name.\n\nClick a tile three times to reset its coordinates.\n\nAt the bottom of the TABS V2 window is a button to reset the sim cache. Use this if you are starting with a formation different from the one shown as most favorable for the Target you have selected.\n\nThe current Target is reflected in the corresponding header letter (red.)"},
+    {"Engines",
+     "Engines are the logic and AwSim/Decoy are the workhorse Engines. Once started, they will run continuously until stopped.\n\nThe difference between the two is that AwSim limits its operation to Active boxes (green check), while Decoy includes Reserve (unmarked) boxes as a destination for transferring units.\n\nThere are four special purpose finite duration Engines which will run in the order selected:\n\n    Column Ops - cycles unit positions in each column.\n    Row Ops - shifts entire rows left and right by 2 positions.\n    Permute - swaps rows for all 24 possible arrangements.\n    Scout - shifts the formation to find an optimal starting position.\n\nEnabling Advanced may improve results by extending operations.\n\nAwSim or Decoy will run last, if selected."},
+    {"Boxgrid",
+     "The Boxgrid is used to show which of the game boxes are occupied (green check), which are not, and which should be excluded from operations (red X.)\n\nThe button below the Boxgrid on the left toggles commonly used regions.\n\nColumns can be toggled by clicking just above them."},
+    {"XEROX Capture",
+     "XEROX reads the current unit formation from the game and copies it into the Boxgrid.\n\nWhile XEROX runs, the red WORKING badge covers the button - don't move the mouse until it clears.\n\nCalibration is sensitive and can occasionally be lost. This is a minor issue. If a XEROX scan produces an inaccurate result, click Setup to recalibrate the grid then rerun XEROX."},
+    {"Moves Per Cycle",
+     "The Moves-Per-Cycle value (1-5) sets how many moves an Engine makes before re-targeting. It applies only to AwSim and Decoy.\n\nClick the '+' button to change the number shown on the left side.\n\nFor shorter sessions of a few minutes an MPC of 1-3 works well."},
+    {"Calibration / Setup",
+     "The first time AwSim runs it looks at the game screen to locate the formation boxes. If it is unable to do so with confidence you will be prompted to assist by pointing to the grid corners.\n\nYou may also be prompted to identify game screen buttons that control unit movement.\n\nCalibration may be performed any time if needed. Click Setup, then follow the on-screen prompt for each point."},
+    {"About",
+     "By crackfed. AwSim was made possible in large part by the encouragement and financial backing of its one paid customer. Thank you, balcy."},
 };
 #define NHELP ((int)(sizeof HELP / sizeof HELP[0]))
 
@@ -1834,15 +2382,15 @@ LRESULT CALLBACK ProcHelp(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) { CloseHelp(); return 0; }
-        if (wp == VK_DOWN || wp == VK_RIGHT) {
+        if (wp == 0x1B) { CloseHelp(); return 0; }
+        if (wp == 0x28 || wp == 0x27) {
             helpSel = (helpSel + 1) % NHELP;  InvalidateRect(w, NULL, TRUE);  return 0;
         }
-        if (wp == VK_UP || wp == VK_LEFT) {
+        if (wp == 0x26 || wp == 0x25) {
             helpSel = (helpSel + NHELP - 1) % NHELP;  InvalidateRect(w, NULL, TRUE);  return 0;
         }
-        if (wp == VK_HOME) { helpSel = 0;         InvalidateRect(w, NULL, TRUE); return 0; }
-        if (wp == VK_END)  { helpSel = NHELP - 1; InvalidateRect(w, NULL, TRUE); return 0; }
+        if (wp == 0x24) { helpSel = 0;         InvalidateRect(w, NULL, TRUE); return 0; }
+        if (wp == 0x23)  { helpSel = NHELP - 1; InvalidateRect(w, NULL, TRUE); return 0; }
         return 0;
 
     case WM_CLOSE:
@@ -1928,7 +2476,7 @@ LRESULT CALLBACK ProcCap(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_KEYDOWN:
-        if (wp == VK_ESCAPE) { pendingStart = FALSE; pendingXerox = FALSE; EndCap(); }
+        if (wp == 0x1B) { pendingStart = FALSE; pendingXerox = FALSE; EndCap(); }
         return 0;
 
     case WM_SETCURSOR:
@@ -1950,10 +2498,10 @@ LRESULT CALLBACK ProcCap(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
    Sub-rectangles below are the red letters' pixel runs in the 580×72
    overlay (A, W, S, i, m → targets 0..4). Section-1-relative coords.
 ═══════════════════════════════════════════════════════════════ */
-static const int LTR_X1[5] = {  54, 170, 282, 400, 504 };
-static const int LTR_X2[5] = {  73, 194, 302, 411, 530 };
-#define LTR_Y1  4
-#define LTR_Y2 24
+static const int LTR_X1[5] = {  49, 163, 279, 397, 501 };
+static const int LTR_X2[5] = {  82, 199, 304, 413, 532 };
+#define LTR_Y1  2
+#define LTR_Y2 27
 
 /* Blit the active target's red letter over the header (black = transparent). */
 static void DrawLetter(HDC dc, int t) {
@@ -2003,7 +2551,7 @@ static const DSeg DS_TIC[] = { {0,2,2},{1,1,3},{2,0,4},{3,1,3},{4,2,2} };   /* d
 static const DSeg *DSEGS[7] = { NULL, DS1, DS2, DS3, DS4, DS5, DS6 };
 static const int   DSEG_N[7] = {    0,   7,   7,   7,   9,   7,   9 };
 
-/* Draw one indicator (digit or tic) at section-2-relative (bx, by). */
+/* EEDDIITT n=  Draw one indicator (digit or tic) at section-2-relative (bx, by). */
 static void DrawIndicator(HDC dc, int bx, int by, int val, BOOL dotMode) {
     if (val == 0) return;
     const DSeg *s;  int n;
@@ -2018,8 +2566,8 @@ static void DrawIndicator(HDC dc, int bx, int by, int val, BOOL dotMode) {
     SelectObject(dc, op);  DeleteObject(pen);
 }
 
-/* Draw the 5×5 white diamond for an active Overdrive button. */
-static void DrawODDiamond(HDC dc, int cx, int cy) {
+/* Draw the 5×5 white diamond for an active Advanced button. */
+static void DrawAdvancedDiamond(HDC dc, int cx, int cy) {
     static const DSeg D[] = { {-2,0,0},{-1,-1,1},{0,-2,2},{1,-1,1},{2,0,0} };
     HPEN pen = CreatePen(PS_SOLID, 1, RGB(255,255,255));
     HPEN op  = (HPEN)SelectObject(dc, pen);
@@ -2047,14 +2595,54 @@ static void BlitBmp(HDC dc, int n) {
     }
 }
 
-/* Small check-mark drawn inside a cell rectangle. */
-static void DrawCheck(HDC dc, int x1, int y1, int x2, int y2) {
-    int cx=(x1+x2)/2, cy=(y1+y2)/2;
-    POINT pts[3] = {{cx-4,cy},{cx-1,cy+3},{cx+5,cy-3}};
-    HPEN pen = CreatePen(PS_SOLID, 2, RGB(255,255,255));
-    HPEN op = (HPEN)SelectObject(dc, pen);
-    Polyline(dc, pts, 3);
-    SelectObject(dc, op);  DeleteObject(pen);
+/* Small check/X mark drawn directly inside a cell without any opaque box.
+   This uses the exact pixel coordinates provided for the source examples, so the
+   transparent mark matches the UI reference without guessing. */
+static void DrawBitmapMark(HDC dc, int sx, int x, int y) {
+    if (sx < 300) {
+        static const int greenSegs[7][2][2] = {
+            {{8, 9}, {-1, -1}},
+            {{7, 9}, {-1, -1}},
+            {{6, 8}, {-1, -1}},
+            {{0, 1}, {5, 7}},
+            {{0, 2}, {4, 6}},
+            {{1, 5}, {-1, -1}},
+            {{2, 4}, {-1, -1}}
+        };
+        for (int r = 0; r < 7; r++) {
+            for (int s = 0; s < 2; s++) {
+                int a = greenSegs[r][s][0];
+                int b = greenSegs[r][s][1];
+                if (a < 0 || b < 0) continue;
+                RECT rc = { x + a, y + r, x + b + 1, y + r + 1 };
+                HBRUSH br = CreateSolidBrush(RGB(46, 255, 92));
+                FillRect(dc, &rc, br);
+                DeleteObject(br);
+            }
+        }
+        return;
+    }
+
+    static const int redSegs[7][2][2] = {
+        {{0, 2}, {6, 8}},
+        {{1, 3}, {5, 7}},
+        {{2, 6}, {-1, -1}},
+        {{3, 5}, {-1, -1}},
+        {{2, 6}, {-1, -1}},
+        {{1, 3}, {5, 7}},
+        {{0, 2}, {6, 8}}
+    };
+    for (int r = 0; r < 7; r++) {
+        for (int s = 0; s < 2; s++) {
+            int a = redSegs[r][s][0];
+            int b = redSegs[r][s][1];
+            if (a < 0 || b < 0) continue;
+            RECT rc = { x + a, y + r, x + b + 1, y + r + 1 };
+            HBRUSH br = CreateSolidBrush(RGB(255, 76, 76));
+            FillRect(dc, &rc, br);
+            DeleteObject(br);
+        }
+    }
 }
 
 /* MPC digit rendered as 7-segment red bars ('figure 8').
@@ -2070,13 +2658,13 @@ static void DrawCheck(HDC dc, int x1, int y1, int x2, int y2) {
  */
 static void DrawMpcSeg(HDC dc, int val) {
     static const RECT SEG[7] = {
-        {110,82,115,83},   /* 0 TOP */
-        {110,88,115,89},   /* 1 MID */
-        {110,94,115,95},   /* 2 BOT */
-        {109,83,110,88},   /* 3 TL  */
-        {115,83,116,88},   /* 4 TR  */
-        {109,89,110,94},   /* 5 BL  */
-        {115,89,116,94},   /* 6 BR  */
+        {51,70,56,71},   /* 0 TOP was 110,82,115,83 */
+        {51,76,56,77},   /* 1 MID was 110,88,115,89 */
+        {51,82,56,83},   /* 2 BOT was 110,94,115,95 */
+        {50,71,51,76},   /* 3 TL  was 109,83,110,88 */
+        {56,71,57,76},   /* 4 TR  was 115,83,116,88 */
+        {50,77,51,82},   /* 5 BL  was 109,89,110,94 */
+        {56,77,57,82},   /* 6 BR  was 115,89,116,94 */
     };
     /* TOP MID BOT TL TR BL BR  for digits 1-5 */
     static const BYTE MASK[5][7] = {
@@ -2132,26 +2720,6 @@ static void DrawDyn1(HDC dc) {
         SelectObject(dc, of);  DeleteObject(f);
     }
 
-    /* ── Momentary button flash: 2 px-wide vertical stripes, DCE314 ──
-       Positions pixel-measured from overlay image (section-1-local).
-       Stripes span y=35..56 (inner button frame).                    */
-    static const struct { DWORD mask; int xl, xr; } STRIPE[5] = {
-        { FLASH_VIEW,   23, 104 },
-        { FLASH_HELP,  136, 217 },
-        { FLASH_START, 249, 330 },
-        { FLASH_SETUP, 362, 443 },
-        { FLASH_EXIT,  475, 556 },
-    };
-    for (int b = 0; b < 5; b++) {
-        if (flashMask & STRIPE[b].mask) {
-            HBRUSH fl = CreateSolidBrush(RGB(220,227,20));   /* DCE314 */
-            RECT rl = { STRIPE[b].xl,   35, STRIPE[b].xl+2, 57 };
-            RECT rr = { STRIPE[b].xr,   35, STRIPE[b].xr+2, 57 };
-            FillRect(dc, &rl, fl);
-            FillRect(dc, &rr, fl);
-            DeleteObject(fl);
-        }
-    }
 }
 
 /* ── Section 2: radio-button indicators + MPC digit ─────── */
@@ -2165,13 +2733,12 @@ static void DrawDyn2(HDC dc) {
         DrawIndicator(dc, CR_CX[r], CR_CY[r] - 3 + (dot ? 1 : 0),
                       engVars[r+1] - '0', dot);
 
-    /* FS indicators: 5 buttons (tics 3-7, y-1); Overdrive for rows 1-3 */
-    for (int r = 0; r < 5; r++) {
+    /* Four FS selectors and their Advanced indicators, in bitmap order. */
+    for (int r = 0; r < 4; r++) {
         DrawIndicator(dc, S2_FS_CX, S2_CY[r] - 4 + (dot ? 1 : 0),
                       engVars[r+3] - '0', dot);
-        /* Overdrive: FS2=r1=[8], FS3=r2=[9], FS4=r3=[10]  (tics 8-10, x+3 y-1) */
-        if (r >= 1 && r <= 3 && engVars[r+7] != '0')
-            DrawODDiamond(dc, S2_OD_CX + 3, S2_CY[r] - 1);
+        if (engVars[r+7] != '0')
+            DrawAdvancedDiamond(dc, S2_OD_CX + 3, S2_CY[r] - 1);
     }
 
     /* MPC digit: 7 red bars shown when CR1 or CR2 is active */
@@ -2204,7 +2771,7 @@ static void DrawDyn2(HDC dc) {
         HPEN   pen = CreatePen(PS_SOLID, 1, RGB(255,17,17));   /* match Section 1 */
         HPEN   op  = (HPEN)SelectObject(dc, pen);
         HBRUSH ob  = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, S2_DN_X1, S2_DN_Y1, S2_DN_X2+1, S2_DN_Y2+1);
+        Rectangle(dc, S2_DN_X1-1, S2_DN_Y1-1, S2_DN_X2+2, S2_DN_Y2+2);
         SelectObject(dc, op);  SelectObject(dc, ob);
         DeleteObject(pen);
     }
@@ -2214,24 +2781,30 @@ static void DrawDyn2(HDC dc) {
         HPEN   pen = CreatePen(PS_SOLID, 1, RGB(255,17,17));   /* match Section 1 */
         HPEN   op  = (HPEN)SelectObject(dc, pen);
         HBRUSH ob  = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-        Rectangle(dc, S2_RST_X1, S2_RST_Y1, S2_RST_X2+1, S2_RST_Y2+1);
+        Rectangle(dc, S2_RST_X1-1, S2_RST_Y1-1, S2_RST_X2+2, S2_RST_Y2+2);
         SelectObject(dc, op);  SelectObject(dc, ob);
         DeleteObject(pen);
     }
 }
 
-/* ── Section 3: checkmarks + 6-button flash ─────────────── */
+/* ── Section 3: checkmarks + action-button flash ────────── */
 static void DrawDyn3(HDC dc) {
     for (int r = 0; r < GROWS; r++)
-        for (int c = 0; c < GCOLS; c++)
-            if (occ[r*GCOLS + c])
-                DrawCheck(dc, S3_CX1[c], S3_RY1[r]+4, S3_CX2[c], S3_RY2[r]+4);
+        for (int c = 0; c < GCOLS; c++) {
+            int idx = r*GCOLS + c;
+            int cx = (S3_CX1[c] + S3_CX2[c]) / 2;
+            int cy = (S3_RY1[r] + S3_RY2[r]) / 2 + 4;
+            if (boxState[idx] == BOX_ACTIVE)
+                DrawBitmapMark(dc, 176, cx-5, cy-3);
+            else if (boxState[idx] == BOX_DISABLED)
+                DrawBitmapMark(dc, 412, cx-4, cy-3);
+        }
 
-    /* 4 bottom button flash — 1px DCE314 rectangle outline each */
-    static const DWORD BITS[4] = {
-        FLASH_S3B1, FLASH_S3B2, FLASH_S3B3, FLASH_S3B4
+    /* Remaining action buttons: 1px DCE314 rectangle outline each */
+    static const DWORD BITS[2] = {
+        FLASH_S3B3, FLASH_S3B4
     };
-    for (int b = 0; b < 4; b++) {
+    for (int b = 0; b < 2; b++) {
         if (flashMask & BITS[b]) {
             HPEN   pen = CreatePen(PS_SOLID, 1, RGB(220,227,20));
             HPEN   op  = (HPEN)SelectObject(dc, pen);
@@ -2251,10 +2824,10 @@ static void DrawDyn4(HDC dc) {
     int x2 = S4_X2[activeTgt] + 2;   /* right edge: 1px wider */
     RECT r;
     /* Top and bottom horizontal strips span full width — corners always connect */
-    r = (RECT){x1-1,  0,   x2,    2  };  FillRect(dc, &r, br);   /* top    2px */
-    r = (RECT){x1,    116, x2,    118};  FillRect(dc, &r, br);   /* bottom 2px */
-    r = (RECT){x1-1,  0,   x1+1,  118};  FillRect(dc, &r, br);  /* left   2px */
-    r = (RECT){x2-2,  1,   x2,    118};  FillRect(dc, &r, br);  /* right  2px */
+    r = (RECT){x1-1,  1,   x2,    3  };  FillRect(dc, &r, br);   /* top    2px */
+    r = (RECT){x1,    117, x2,    119};  FillRect(dc, &r, br);   /* bottom 2px */
+    r = (RECT){x1-1,  1,   x1+1,  119};  FillRect(dc, &r, br);  /* left   2px */
+    r = (RECT){x2-2,  2,   x2,    119};  FillRect(dc, &r, br);  /* right  2px */
     DeleteObject(br);
 }
 
@@ -2263,12 +2836,14 @@ static void DrawDyn4(HDC dc) {
 ═══════════════════════════════════════════════════════════════ */
 static void ClickSect1(int mx, int ry) {
     if (ry < S1_BTN_Y1 || ry > S1_BTN_Y2) return;
-    if      (mx>=13  && mx<=63)  { FlashBtn(FLASH_VIEW,  0); SetView((viewState+5)%6); }
-    else if (mx>=65  && mx<=114) { FlashBtn(FLASH_VIEW,  0); SetView((viewState+1)%6); }
-    else if (mx>=126 && mx<=227) { FlashBtn(FLASH_HELP,  0); OpenHelp(); }
-    else if (mx>=239 && mx<=340) { FlashBtn(FLASH_START, 0); running ? StopAuto() : StartAuto(); }
+    if      (mx>=13  && mx<=63)  { SetView((viewState+5)%6); }
+    else if (mx>=65  && mx<=114) { SetView((viewState+1)%6); }
+    else if (mx>=126 && mx<=227) {
+        if (wHelp) CloseHelp();
+        else OpenHelp();
+    }
+    else if (mx>=239 && mx<=340) { running ? StopAuto() : StartAuto(); }
     else if (mx>=352 && mx<=453) {
-        FlashBtn(FLASH_SETUP, 0);
         if (!running) {
             /* Clicking Setup clears grid + row/swap button calibration,
                forcing fresh capture (targets are left untouched). */
@@ -2281,7 +2856,11 @@ static void ClickSect1(int mx, int ry) {
             StartCap(1);
         }
     }
-    else if (mx>=465 && mx<=566) { FlashBtn(FLASH_EXIT,  0); StopAuto(); DestroyWindow(wMain); }
+    else if (mx>=465 && mx<=566) {
+        LogApp("Window exit button clicked.");
+        app.exitPending = TRUE;
+        if (StopAuto()) { app.exitPending = FALSE; DestroyWindow(wMain); }
+    }
 }
 
 static void ClickSect2(int mx, int ry) {
@@ -2297,24 +2876,22 @@ static void ClickSect2(int mx, int ry) {
     if (mx>=S2_MPC_X1 && mx<=S2_MPC_X2 && ry>=S2_MPC_Y1 && ry<=S2_MPC_Y2) {
         FlashBtn(FLASH_MPC, 1);  MpcCycle();  InvalidateSect(1);  SaveIni();  return;
     }
-    /* CR1 AwSim (cy=58) */
+    /* CR1 AwSim */
     if (mx>=S2_CR_XA && mx<=S2_CR_XB &&
         ry >= S2_CR1_Y - S2_ROW_YTOL && ry <= S2_CR1_Y + S2_ROW_YTOL) {
         EngineClick(1);  InvalidateSect(1);  SaveIni();  return;
     }
-    /* CR2 Decoy (cy=117) — x-range distinguishes it from FS5 at same y */
+    /* CR2 Decoy */
     if (mx>=S2_CR_XA && mx<=S2_CR_XB &&
         ry >= S2_CR2_Y - S2_ROW_YTOL && ry <= S2_CR2_Y + S2_ROW_YTOL) {
         EngineClick(2);  InvalidateSect(1);  SaveIni();  return;
     }
-    /* FS buttons 1-5 + Overdrive for rows 1-3 */
-    for (int r = 0; r < 5; r++) {
+    /* FS left selectors and right Advanced controls. */
+    for (int r = 0; r < 4; r++) {
         if (ry < S2_CY[r] - S2_ROW_YTOL || ry > S2_CY[r] + S2_ROW_YTOL) continue;
-        /* Overdrive first — x=440..478, only for FS2/3/4 (r=1,2,3) */
-        if (r >= 1 && r <= 3 && mx>=S2_OD_XA && mx<=S2_OD_XB) {
+        if (mx>=S2_OD_XA && mx<=S2_OD_XB) {
             EngineClick(r+7);  InvalidateSect(1);  SaveIni();  return;
         }
-        /* FS button — x=185..439 */
         if (mx>=S2_FS_XA && mx<=S2_FS_XB) {
             EngineClick(r+3);  InvalidateSect(1);  SaveIni();  return;
         }
@@ -2334,37 +2911,18 @@ static void ClickSect3(int mx, int ry) {
         for (int c = 0; c < GCOLS; c++) {
             if (mx < S3_CX1[c] || mx > S3_CX2[c]) continue;
             int idx = r*GCOLS + c;
-            if (cycleState != 0) {
-                memcpy(customOcc, occ, sizeof occ);
-                cycleState = 0;
-            }
-            occ[idx] = customOcc[idx] = !occ[idx];
+            boxState[idx] = (BYTE)((boxState[idx] + 1) % 3);
             InvalidateSect(2);  SaveIni();  return;
         }
     }
-    /* 4 bottom action buttons: Save, Load, Toggle Presets, XEROX */
-    for (int b = 0; b < 4; b++) {
+    /* Remaining bottom action buttons: Toggle Presets and XEROX */
+    for (int b = 0; b < 2; b++) {
         if (mx < S3_BTN_X1[b] || mx > S3_BTN_X2[b]) continue;
         if (ry < S3_BTN_Y1[b] || ry > S3_BTN_Y2[b]) continue;
         FlashBtn(1u << (8+b), 2);
         switch (b) {
-        case 0:                                     /* Save            */
-            memcpy(customOcc, occ, sizeof occ);
-            cycleState = 0;
-            SaveIni();
-            break;
-        case 1: {                                   /* Load            */
-            char s[NCELLS+2] = "";
-            IniGetStr("_FormationSaved", "", s, sizeof s);
-            int slen = (int)strlen(s);
-            for (int i = 0; i < NCELLS; i++)
-                customOcc[i] = (i < slen && s[i]=='1') ? TRUE : FALSE;
-            ApplyCycle(0);
-            SaveIni();
-            break;
-        }
-        case 2: TogglePresets();  break;            /* Toggle Presets  */
-        case 3: StartXerox();     break;            /* XEROX           */
+        case 0: TogglePresets();  break;
+        case 1: StartXerox();     break;
         }
         return;
     }
@@ -2408,14 +2966,19 @@ LRESULT CALLBACK ProcMain(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
 
     case WM_TIMER:
+        if (wp == IDT_STOP_POLL) {
+            if (StopAuto() && app.exitPending) {
+                app.exitPending = FALSE;
+                DestroyWindow(w);
+            }
+            return 0;
+        }
         if (wp == IDT_FLASH) {
             DWORD prev = flashMask;  flashMask = 0;
             KillTimer(w, IDT_FLASH);
-            if (prev & (FLASH_VIEW|FLASH_HELP|FLASH_START|FLASH_SETUP|FLASH_EXIT))
-                InvalidateSect(0);
             if (prev & (FLASH_MPC|FLASH_DN|FLASH_RST))
                 InvalidateSect(1);
-            if (prev & (FLASH_S3B1|FLASH_S3B2|FLASH_S3B3|FLASH_S3B4))
+            if (prev & (FLASH_S3B3|FLASH_S3B4))
                 InvalidateSect(2);
         }
         return 0;
@@ -2506,17 +3069,32 @@ LRESULT CALLBACK ProcMain(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return HTCLIENT;
     }
 
-    case WM_STOPAUTO:   StopAuto();                  return 0;
-    case WM_EXITAPP:    StopAuto(); DestroyWindow(w); return 0;
+    case WM_STOPAUTO:
+        if (StopAuto() && app.exitPending) {
+            app.exitPending = FALSE;
+            DestroyWindow(w);
+        }
+        return 0;
+    case WM_EXITAPP:
+        LogApp("Emergency exit message received.");
+        app.exitPending = TRUE;
+        EndCap();
+        SaveIni();
+        if (StopAuto()) { app.exitPending = FALSE; DestroyWindow(w); }
+        return 0;
     case WM_STARTDEFER: StartAuto();                 return 0;
     case WM_XEROXDEFER: StartXerox();                return 0;
+    case WM_TASKBARPROMPT: PromptTaskbarPin();       return 0;
 
     case WM_CLOSE:
-        StopAuto();  EndCap();  SaveIni();
-        DestroyWindow(w);
+        LogApp("Main window received WM_CLOSE.");
+        app.exitPending = TRUE;
+        EndCap();  SaveIni();
+        if (StopAuto()) { app.exitPending = FALSE; DestroyWindow(w); }
         return 0;
 
     case WM_DESTROY:
+        LogApp("Main window destroyed.");
         SaveIni();       /* always save on any exit path */
         FreeBmps();
         PostQuitMessage(0);
@@ -2528,8 +3106,34 @@ LRESULT CALLBACK ProcMain(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 /* ═══════════════════════════════════════════════════════════════
    WINMAIN
 ═══════════════════════════════════════════════════════════════ */
+static void EnableDpiAwareness(void) {
+    HMODULE user32 = GetModuleHandleA("user32.dll");
+    typedef BOOL (WINAPI *SetDpiContextFn)(HANDLE);
+    FARPROC proc = user32 ? GetProcAddress(user32, "SetProcessDpiAwarenessContext") : NULL;
+    SetDpiContextFn setContext = NULL;
+    if (proc) memcpy(&setContext, &proc, sizeof setContext);
+    if (setContext && setContext((HANDLE)(LONG_PTR)-4)) return;
+    SetProcessDPIAware();
+}
+
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
     (void)_prev;  (void)_cmd;
+    debugMode = HasDebugArgument();
+    HANDLE instanceMutex = CreateMutexA(NULL, FALSE, "Local\\AwSim.SingleInstance");
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND existing = NULL;
+        for (int attempt = 0; attempt < 20 && !existing; attempt++) {
+            existing = FindWindowA(CLS_MAIN, NULL);
+            if (!existing) Sleep(50);
+        }
+        if (existing) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        CloseHandle(instanceMutex);
+        return 0;
+    }
+    EnableDpiAwareness();
     hI = hi;
     srand((unsigned)time(NULL));
 
@@ -2540,8 +3144,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
     hLetters = (HBITMAP)LoadImageA(hi, "LETTERSBMP", IMAGE_BITMAP,
                                    0, 0, LR_CREATEDIBSECTION);
 
-    memset(occ,          0, sizeof occ);
-    memset(customOcc,    0, sizeof customOcc);
+    memset(boxState,     0, sizeof boxState);
     memset(tgtSet,       0, sizeof tgtSet);
     memset(tgtX,         0, sizeof tgtX);
     memset(tgtY,         0, sizeof tgtY);
@@ -2550,6 +3153,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
 
     MakeIniPath();
     LoadIni();
+    app.taskbarPromptPending = !IsTaskbarPinned();
     LoadBmps();
 
     /* Compute sectionY for the loaded view state */
@@ -2560,7 +3164,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
       }
     }
 
-    /* occ[] is loaded directly from _Formation in LoadIni — no rebuild needed. */
+    /* boxState[] is loaded directly from _Formation in LoadIni. */
 
     /* ── Register main window class ────────────────────────── */
     WNDCLASSEXA wcx;
@@ -2601,8 +3205,25 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
     for (int i = 0; i < 4; i++)
         if (VIEW_VIS[viewState][i]) winH += SECT_H[i];
 
-    int wx = (winSX == INI_UNSET) ? CW_USEDEFAULT : winSX;
-    int wy = (winSY == INI_UNSET) ? CW_USEDEFAULT : winSY;
+    int sw = GetSystemMetrics(SM_CXSCREEN);
+    int sh = GetSystemMetrics(SM_CYSCREEN);
+    int defaultX = (sw * 49) / 100;
+    int defaultY = (sh * 18) / 100;
+
+    int wx = (winSX == INI_UNSET) ? defaultX : winSX;
+    int wy = (winSY == INI_UNSET) ? defaultY : winSY;
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (vw >= WIN_W) {
+        if (wx < vx) wx = vx;
+        if ((long long)wx + WIN_W > (long long)vx + vw) wx = vx + vw - WIN_W;
+    }
+    if (vh >= winH) {
+        if (wy < vy) wy = vy;
+        if ((long long)wy + winH > (long long)vy + vh) wy = vy + vh - winH;
+    }
 
     wMain = CreateWindowExA(
         WS_EX_APPWINDOW,
@@ -2622,25 +3243,31 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE _prev, LPSTR _cmd, int show) {
         SetWindowPos(wMain, NULL, winSX, winSY, 0, 0,
                      SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
 
-    /* Boxgrid calibration chain (run at 100% zoom — the saved grid is stored
-       at 100%, so detection must happen there too):
+    /* Boxgrid calibration chain:
        - saved grid present  -> auto-calibrate from the 24 dark intersection
          diamonds; if they aren't found, AutoCalibrateGrid leaves the saved
          values untouched (revert to saved).
-       - no saved grid        -> auto-detect from the diamond lattice, else
-         ask the user to mark the corners. */
-    {
-        int calMag = MagDropTo100();
-        if (calMag) Sleep(200);
-        if (gridSet) {
-            if (AutoCalibrateGrid()) SaveIni();
-            MagRestore(calMag);
-        } else {
-            BOOL got = DetectGridColdStart();
-            MagRestore(calMag);              /* restore before any user marking */
-            if (got) SaveIni();
-            else StartCap(1);
+       - no saved grid        -> ask the user to mark the corners. */
+    if (gridSet) {
+        if (AutoCalibrateGrid()) SaveIni();
+        else {
+            LogApp("Grid auto-calibration did not lock; retained saved calibration.");
+            SetAppStatus("Using saved grid calibration");
         }
+    } else {
+        /* No saved grid: try to auto-detect it from the diamond lattice;
+           only fall back to corner marking if that can't lock confidently. */
+        if (DetectGridColdStart()) SaveIni();
+        else {
+            LogApp("Cold-start grid detection failed; requesting manual calibration.");
+            SetAppStatus("Mark game grid");
+            StartCap(1);
+        }
+    }
+    if (!wCap) SetAppStatus("Ready");
+    if (!wCap && app.taskbarPromptPending) {
+        app.taskbarPromptPending = FALSE;
+        PostMessage(wMain, WM_TASKBARPROMPT, 0, 0);
     }
 
     MSG mmsg;

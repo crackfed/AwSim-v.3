@@ -29,13 +29,5 @@ Makefile
 Thumbs.db
 Desktop.ini
 ehthumbs.db
-*.zip  
-oldver*/  
-BMPfiles/  
-a/  
-files/  
-files.zip  
 *.cmd 
-lastgood/
-newBMP/
 
